@@ -8,7 +8,7 @@
   "--draft-vocab",
   "data/draft_vocab_en.bin",
   "--max-context",
-  "131072",
+  "65536",
   "--spec",
   "4",
   "--lookup",
@@ -16,13 +16,14 @@
   "--conversation-cache-mib",
   "16384",
   "--batch",
-  "2",
+  "4",
   "--vision"
  ],
  "cwd": ".",
  "env": {
-  "FNX_KV_RESERVE_MIB": "3072",
-  "FNX_SKIP_BAR1_CHECK": "1"
+  "FNX_KV_RESERVE_MIB": "2560",
+  "FNX_SKIP_BAR1_CHECK": "1",
+  "FNX_MLOCK_SOFT": "1"
  },
  "tokenizer": "data/tokenizer",
  "model_name": "qwen3.8-27b-q8_0-sfnx-sm61",

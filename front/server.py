@@ -4915,7 +4915,7 @@ def check_config(path) -> None:
         if arg(flag) is not None:
             files[flag] = Path(cwd) / arg(flag)
     missing = [f"{what} {p}" for what, p in files.items() if not p.is_file()]
-    if arg("--mtp") is not None and not (Path(cwd) / arg("--mtp")).is_dir():
+    if arg("--mtp") not in (None, "nextn") and not (Path(cwd) / arg("--mtp")).is_dir():
         missing.append(f"--mtp {Path(cwd) / arg('--mtp')}")
     if missing:
         raise SystemExit(f"[sfnx] {path}: missing {'; '.join(missing)}")

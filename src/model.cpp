@@ -394,26 +394,35 @@ struct Up {
         }
         return put<uint16_t>(h.data(), h.size() * 2);
     }
+    // Z420 sm61-port: split Q8_0 slices directly on the host before uploading, avoiding 58 GB of H2D->D2H->cudaFree round-trips
+    DW finish_slice(DW w, const std::vector<uint8_t>& h) {
+        if (w.type == T_Q8_0) {
+            const size_t nblk = h.size() / 34;
+            std::vector<int8_t> q(nblk * 32);
+            std::vector<uint16_t> d(nblk);
+            for (size_t b = 0; b < nblk; ++b) {
+                std::memcpy(&d[b], &h[b * 34], 2);
+                std::memcpy(&q[b * 32], &h[b * 34 + 2], 32);
+            }
+            w.p = nullptr;
+            w.s.q = put<int8_t>(q.data(), q.size());
+            w.s.d = put<uint16_t>(d.data(), d.size() * 2);
+            return w;
+        }
+        w.p = put<uint8_t>(h.data(), h.size());
+        return w;
+    }
     // a dense matrix for q8s_gemv: Q8_0 slices move to the split layout (other types stay as they are)
     DW dense(DW w) {
-        if (w.type != T_Q8_0) return w;
-        const size_t bytes = (size_t) w.n_out * w.row_bytes, nblk = bytes / 34;
+        if (w.type != T_Q8_0 || w.s.q) return w;
+        const size_t bytes = (size_t) w.n_out * w.row_bytes;
         std::vector<uint8_t> h(bytes);
         ck(cudaMemcpy(h.data(), w.p, bytes, cudaMemcpyDeviceToHost), "dense: download");
         if (store) store->free_dev(c.dev, w.p, bytes);   // the upload just before: its room is used again
         else ck(cudaFree(w.p), "dense: free");
         if (track) track->erase(std::remove(track->begin(), track->end(), (void*) w.p), track->end());   // not freed twice
         c.bytes -= bytes;
-        std::vector<int8_t> q(nblk * 32);
-        std::vector<uint16_t> d(nblk);
-        for (size_t b = 0; b < nblk; ++b) {
-            std::memcpy(&d[b], &h[b * 34], 2);
-            std::memcpy(&q[b * 32], &h[b * 34 + 2], 32);
-        }
-        w.p = nullptr;
-        w.s.q = put<int8_t>(q.data(), q.size());
-        w.s.d = put<uint16_t>(d.data(), d.size() * 2);
-        return w;
+        return finish_slice(w, h);
     }
     // bf16 values [n] as the split int8 layout (per 32 values: d = amax / 127, ggml's rounding)
     Q8S q8split_bf16(const uint16_t* v, size_t n) {
@@ -460,8 +469,7 @@ struct Up {
         w.row_bytes = t.row_bytes();
         std::vector<uint8_t> h(rows.size() * w.row_bytes);
         for (size_t i = 0; i < rows.size(); ++i) std::memcpy(&h[i * w.row_bytes], row_of(t, rows[i], w.row_bytes), w.row_bytes);
-        w.p = put<uint8_t>(h.data(), h.size());
-        return w;
+        return finish_slice(w, h);
     }
     // rows r1 of t1 then rows r2 of t2 (same type and row width), one matrix
     DW rows2(const Tensor& t1, const std::vector<int>& r1, const Tensor& t2, const std::vector<int>& r2) {
@@ -475,8 +483,7 @@ struct Up {
         size_t o = 0;
         for (int r : r1) { std::memcpy(&h[o], row_of(t1, r, w.row_bytes), w.row_bytes); o += w.row_bytes; }
         for (int r : r2) { std::memcpy(&h[o], row_of(t2, r, w.row_bytes), w.row_bytes); o += w.row_bytes; }
-        w.p = put<uint8_t>(h.data(), h.size());
-        return w;
+        return finish_slice(w, h);
     }
 #if FNX_27B
     // rows r1 of t1, r2 of t2, then r3 of t3, one matrix
@@ -493,8 +500,7 @@ struct Up {
         size_t o = 0;
         for (const auto& [t, rs] : {std::pair{&t1, &r1}, std::pair{&t2, &r2}, std::pair{&t3, &r3}})
             for (int r : *rs) { std::memcpy(&h[o], row_of(*t, r, w.row_bytes), w.row_bytes); o += w.row_bytes; }
-        w.p = put<uint8_t>(h.data(), h.size());
-        return w;
+        return finish_slice(w, h);
     }
 #endif
     // rows `rows` of t1 then of t2 as f32 (F32 rows as they are, Q8_0 rows dequantized)
@@ -540,8 +546,7 @@ struct Up {
         for (int r = 0; r < w.n_out; ++r)
             for (size_t b = 0; b < blocks.size(); ++b)
                 std::memcpy(&h[(size_t) r * w.row_bytes + b * ti.bytes], t.data + (size_t) r * src_row + (size_t) blocks[b] * ti.bytes, ti.bytes);
-        w.p = put<uint8_t>(h.data(), h.size());
-        return w;
+        return finish_slice(w, h);
     }
     // per expert: rows [r0, r1) (gate / up), expert-major
     static void row_range(const Tensor& t, int r0, int r1) {

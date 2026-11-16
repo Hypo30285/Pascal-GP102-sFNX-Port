@@ -185,9 +185,126 @@ void pf_gemm(Engine::Pf& p, const __half* W, int rows, int cols, const __half* X
                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
         "gemm");
 }
-// out = W . X for a Q8_0 matrix (the split layout, dequantized to f16 first)
+
+// Z420 sm61-port: GP102 (__dp4a INT8, 47 TOPS/card) prefill GEMM over the split Q8_0 layout, avoiding V100's
+// k_q8s_f16 dequantization and Pascal's FP32 SIMT fallback in cublasGemmEx(CUDA_R_16F).
+__global__ void __launch_bounds__(256) k_pf_quant_q8(const __half* __restrict__ X, size_t nblk, int8_t* __restrict__ xq, float* __restrict__ xd) {
+    const size_t b = ((size_t) blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (b >= nblk) return;
+    const int lane = threadIdx.x & 31;
+    const float v = __half2float(X[b * 32 + lane]);
+    float amax = fabsf(v);
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, d));
+    const float scale = amax / 127.0f;
+    const float iscale = amax > 0.0f ? 127.0f / amax : 0.0f;
+    xq[b * 32 + lane] = (int8_t) __float2int_rn(v * iscale);
+    if (lane == 0) xd[b] = scale;
+}
+
+template <int BN, int TC>
+__global__ void __launch_bounds__(256, 4) k_pf_q8s_dp4a(const int8_t* __restrict__ wq, const uint16_t* __restrict__ wd,
+                                                        const int8_t* __restrict__ xq, const float* __restrict__ xd,
+                                                        float* __restrict__ out, int rows, int cols, int C, int ldo) {
+    constexpr int BM = 64, TR = 4;
+    static_assert(BM / TR * (BN / TC) == 256, "256 threads cover BM x BN");
+    __shared__ int sw[8][BM + 1];
+    __shared__ int sx[8][BN + 1];
+    __shared__ float sdw[BM];
+    __shared__ float sdx[BN];
+
+    const int r0 = blockIdx.x * BM, t0 = blockIdx.y * BN, tid = threadIdx.x, nb = cols >> 5;
+    const int tr = (tid / (BN / TC)) * TR, tc = (tid % (BN / TC)) * TC;
+    const int half_id = tid & 127, lr = half_id >> 1, lk4 = (half_id & 1) * 4;
+    float acc[TR][TC] = {};
+
+    for (int b = 0; b < nb; ++b) {
+        if (tid < 128) {
+            const int gr = r0 + lr;
+            const int4 w4 = gr < rows ? __ldg(reinterpret_cast<const int4*>(wq + (size_t) gr * cols + b * 32 + lk4 * 4)) : make_int4(0, 0, 0, 0);
+            sw[lk4 + 0][lr] = w4.x;
+            sw[lk4 + 1][lr] = w4.y;
+            sw[lk4 + 2][lr] = w4.z;
+            sw[lk4 + 3][lr] = w4.w;
+            if ((tid & 1) == 0) sdw[lr] = gr < rows ? __half2float(__ushort_as_half(__ldg(wd + (size_t) gr * nb + b))) : 0.0f;
+        } else if (lr < BN) {
+            const int gt = t0 + lr;
+            const int4 x4 = gt < C ? __ldg(reinterpret_cast<const int4*>(xq + (size_t) gt * cols + b * 32 + lk4 * 4)) : make_int4(0, 0, 0, 0);
+            sx[lk4 + 0][lr] = x4.x;
+            sx[lk4 + 1][lr] = x4.y;
+            sx[lk4 + 2][lr] = x4.z;
+            sx[lk4 + 3][lr] = x4.w;
+            if ((tid & 1) == 0) sdx[lr] = gt < C ? __ldg(xd + (size_t) gt * nb + b) : 0.0f;
+        }
+        __syncthreads();
+
+        int dp[TR][TC] = {};
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            int wv[TR], xv[TC];
+#pragma unroll
+            for (int i = 0; i < TR; ++i) wv[i] = sw[k][tr + i];
+#pragma unroll
+            for (int j = 0; j < TC; ++j) xv[j] = sx[k][tc + j];
+#pragma unroll
+            for (int i = 0; i < TR; ++i) {
+#pragma unroll
+                for (int j = 0; j < TC; ++j) dp[i][j] = __dp4a(wv[i], xv[j], dp[i][j]);
+            }
+        }
+        float dw[TR], dx[TC];
+#pragma unroll
+        for (int i = 0; i < TR; ++i) dw[i] = sdw[tr + i];
+#pragma unroll
+        for (int j = 0; j < TC; ++j) dx[j] = sdx[tc + j];
+#pragma unroll
+        for (int i = 0; i < TR; ++i) {
+#pragma unroll
+            for (int j = 0; j < TC; ++j) acc[i][j] = fmaf((float) dp[i][j], dw[i] * dx[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < TC; ++j) {
+        const int gt = t0 + tc + j;
+        if (gt < C) {
+#pragma unroll
+            for (int i = 0; i < TR; ++i) {
+                const int gr = r0 + tr + i;
+                if (gr < rows) out[(size_t) gt * ldo + gr] = acc[i][j];
+            }
+        }
+    }
+}
+
+// out = W . X for a Q8_0 matrix (the split layout: dp4a on sm_61 by default, or dequantized to f16 for cuBLAS when FNX_PF_DP4A=0)
 void pf_dense(Engine::Pf& p, const DW& w, const __half* X, int C, float* out) {
     if (!w.s.q) throw std::runtime_error("prefill: a dense matrix without the split Q8_0 layout");
+    static const bool use_dp4a = [] {
+        const char* e = std::getenv("FNX_PF_DP4A");
+        if (e && std::strcmp(e, "0") && std::strcmp(e, "1")) throw std::runtime_error(std::string("FNX_PF_DP4A: 0 or 1, not '") + e + "'");
+        return e ? !std::strcmp(e, "1") : (FNX_ARCH < 70);
+    }();
+    if (use_dp4a && C > 0) {
+        const int rows = w.n_out, cols = w.n_in, nb = cols / 32;
+        const size_t nblk = (size_t) C * nb;
+        const size_t xd_bytes = (nblk * sizeof(float) + 255) & ~size_t(255);
+        const size_t xq_bytes = (size_t) C * cols;
+        if (xd_bytes + xq_bytes > p.wh_halves * sizeof(__half))
+            throw std::runtime_error("prefill: X q8 staging exceeds wh buffer");
+        float* xd = reinterpret_cast<float*>(p.wh);
+        int8_t* xq = reinterpret_cast<int8_t*>(p.wh) + xd_bytes;
+        k_pf_quant_q8<<<(unsigned) ((nblk + 7) / 8), 256, 0, p.st>>>(X, nblk, xq, xd);
+        if (C <= 16) {
+            const dim3 grid((rows + 63) / 64, 1);
+            k_pf_q8s_dp4a<16, 1><<<grid, 256, 0, p.st>>>(w.s.q, w.s.d, xq, xd, out, rows, cols, C, rows);
+        } else {
+            const dim3 grid((rows + 63) / 64, (C + 63) / 64);
+            k_pf_q8s_dp4a<64, 4><<<grid, 256, 0, p.st>>>(w.s.q, w.s.d, xq, xd, out, rows, cols, C, rows);
+        }
+        return;
+    }
     const size_t n = (size_t) w.n_out * w.n_in;
     if (n > p.wh_halves) throw std::runtime_error("prefill: a matrix larger than the f16 staging");
     k_q8s_f16<<<grid_for(n), 256, 0, p.st>>>(w.s.q, w.s.d, n, p.wh);

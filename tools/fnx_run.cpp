@@ -478,7 +478,7 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
             }
         }
         const fnx::Mtp mtp(m, MTP_RT, FNX_DIR "/data/draft_vocab_en.bin");
-        fnx::Engine e(m, env_ctx(262144), 6);
+        fnx::Engine e(m, (int) fnx::env_int("FNX_MAX_CTX", 262144), (int) fnx::env_int("FNX_LANES", 6));
         e.mtp_attach(mtp);
         const std::vector<int> eos{248044, 248046};
         fnx::Sampling greedy, served;
@@ -653,7 +653,7 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
         const std::string names = argc > 5 ? argv[5] : "prose2,code1";
         if (fnx::batch_drafts() == fnx::BatchDrafts::off) { std::fprintf(stderr, "bdecode: set FNX_BATCH_DRAFTS (lookup or 1)\n"); return 2; }
         const fnx::Mtp mtp(m, MTP_RT, FNX_DIR "/data/draft_vocab_en.bin");
-        fnx::Engine e(m, env_ctx(262144), 6);
+        fnx::Engine e(m, (int) fnx::env_int("FNX_MAX_CTX", 262144), (int) fnx::env_int("FNX_LANES", 6));
         e.mtp_attach(mtp);
         const std::vector<int> eos{248044, 248046};
         std::vector<int> lanes{0};

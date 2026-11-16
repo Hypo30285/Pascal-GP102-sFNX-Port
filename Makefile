@@ -40,7 +40,7 @@ ref: ref/fnx_ref ref/fnx_logref ref/img_logref ref/mmid_bench
 trace: tools/trace/libcupti_trace.so
 CUPTI := $(CUDA)/extras/CUPTI
 tools/trace/libcupti_trace.so: tools/trace/cupti_trace.cpp
-	$(HOSTCXX) -O2 -std=c++17 -shared -fPIC -I$(CUPTI)/include -I$(CUDA)/include -o $@ $< \
+	$(HOSTCXX) -O2 -std=c++17 $(HOST_ISA) -pthread -shared -fPIC -I$(CUPTI)/include -I$(CUDA)/include -o $@ $< \
 	    -L$(CUPTI)/lib64 -Wl,-rpath,$(CUPTI)/lib64 -lcupti -lpthread
 # no built-in rules: with them make remakes an included build/kernels_p0.d by `%: %.o` from build/kernels_p0.d.o, which
 # the kernels_p% rule then compiles with FNX_KPART=0.d ("floating constant in preprocessor expression")
@@ -84,7 +84,7 @@ $(if $(filter 2 3 4 6 8,$(FNX_NCARD)),,$(error FNX_NCARD: 2, 3, 4, 6 or 8 (the 2
 NVFLAGS += -DFNX_NCARD=$(FNX_NCARD) -DFNX_ARCH=$(ARCH)
 ifeq ($(ARCH),61)
 HOST_ISA ?= -march=ivybridge -mtune=ivybridge -mavx -mf16c -mno-avx2 -mno-fma
-LLAMA_ISA ?= -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=ON -DGGML_AVX512=OFF
+LLAMA_ISA ?= -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=ON -DGGML_AVX512=OFF -DGGML_BMI2=OFF
 endif
 NVFLAGS += $(if $(HOST_ISA),-Xcompiler "$(HOST_ISA)")
 # the model (src/model.hpp): fnx (Flash-Next, prod) or 27b (Qwen3.8-27B: src/s27_*, bin/s27_run). build/model holds
@@ -119,25 +119,25 @@ $(call stamp,build/cuda,$(NVCC_ID))
 STAMPS := build/ncard build/arch build/cuda build/model
 
 bin/gguf_test: tools/gguf_test.cpp src/gguf.cpp src/gguf.hpp src/rope_gguf.hpp build/model
-	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -DFNX_27B=$(FNX_27B) -o $@ tools/gguf_test.cpp src/gguf.cpp
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 $(HOST_ISA) -pthread -DFNX_27B=$(FNX_27B) -o $@ tools/gguf_test.cpp src/gguf.cpp
 bin/ple_test: tools/ple_test.cpp tools/ref_tokens.hpp src/ple_io.cpp src/ple_io.hpp src/env.hpp src/gguf.cpp src/gguf.hpp build/model
-	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -Wall -pthread -DFNX_27B=$(FNX_27B) -o $@ tools/ple_test.cpp src/ple_io.cpp src/gguf.cpp
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 $(HOST_ISA) -pthread -Wall -pthread -DFNX_27B=$(FNX_27B) -o $@ tools/ple_test.cpp src/ple_io.cpp src/gguf.cpp
 bin/stage_test: tools/stage_test.cpp src/gguf.cpp src/gguf.hpp build/model
-	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -DFNX_27B=$(FNX_27B) -o $@ tools/stage_test.cpp src/gguf.cpp -lpthread
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 $(HOST_ISA) -pthread -DFNX_27B=$(FNX_27B) -o $@ tools/stage_test.cpp src/gguf.cpp -lpthread
 bin/sfnx_input_test: tools/sfnx_input_test.cpp tools/sfnx_input.hpp
-	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -Wall -pthread -o $@ tools/sfnx_input_test.cpp
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 $(HOST_ISA) -pthread -Wall -pthread -o $@ tools/sfnx_input_test.cpp
 # the batched drafts' row plan, on the CPU alone
 bin/batch_plan_test: tools/batch_plan_test.cpp src/batch_plan.hpp build/model
-	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -Wall -DFNX_27B=$(FNX_27B) -o $@ tools/batch_plan_test.cpp
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 $(HOST_ISA) -pthread -Wall -DFNX_27B=$(FNX_27B) -o $@ tools/batch_plan_test.cpp
 # the prompt path's ring plan against the two- and three-card sequences, and every supported count's sum, on the CPU
 bin/pf_ring_plan_test: tools/pf_ring_plan_test.cpp src/pf_ring_plan.hpp src/card_split.hpp src/model.hpp src/gguf.hpp build/ncard build/model
-	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -DFNX_27B=$(FNX_27B) -o $@ tools/pf_ring_plan_test.cpp
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 $(HOST_ISA) -pthread -Wall -DFNX_NCARD=$(FNX_NCARD) -DFNX_27B=$(FNX_27B) -o $@ tools/pf_ring_plan_test.cpp
 # YaRN's band, angles and magnitude against ggml's, on the CPU alone
 bin/rope_test: tools/rope_test.cpp src/rope.hpp
-	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -Wall -o $@ tools/rope_test.cpp
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 $(HOST_ISA) -pthread -Wall -o $@ tools/rope_test.cpp
 # the start-up card checks against real cards' numbers and sysfs text, on the CPU alone
 bin/card_check_test: tools/card_check_test.cpp src/card_check.hpp src/peer_probe.hpp src/model.hpp src/card_split.hpp src/gguf.hpp build/ncard build/model
-	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -DFNX_27B=$(FNX_27B) -o $@ tools/card_check_test.cpp
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 $(HOST_ISA) -pthread -Wall -DFNX_NCARD=$(FNX_NCARD) -DFNX_27B=$(FNX_27B) -o $@ tools/card_check_test.cpp
 
 # one object per source in build/ (headers tracked by nvcc's own dependency files), so a change recompiles only the
 # objects it touches; every engine program and the lab's library link the same objects (position independent).
@@ -248,7 +248,7 @@ llama-check: $(LU)/build/bin/libmtmd.so
 	[ -n "$$now" ] || { echo "llama-check: no version in $(NVCC) --version: '$$ver'" >&2; exit 1; }; \
 	[ "$$was" = "$$now" ] || { echo "llama-check: llama.cpp in $(LU)/build was configured with nvcc $$was ($$1), this build's $(NVCC) is $$now. CMake keeps the compiler it first found: move $(LU)/build aside and make builds it again with $(NVCC)" >&2; exit 1; }
 bin/sfnx-vision: vision/sfnx_vision.cpp vision/*.h $(LU)/build/bin/libmtmd.so build/arch | llama-check
-	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -I$(LU)/include -I$(GG)/include -I$(LU)/tools/mtmd -o $@ vision/sfnx_vision.cpp \
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 $(HOST_ISA) -pthread -I$(LU)/include -I$(GG)/include -I$(LU)/tools/mtmd -o $@ vision/sfnx_vision.cpp \
 	    -L$(LU)/build/bin -lmtmd -lllama -lggml -lggml-base -lggml-cpu -Wl,-rpath,$(LU)/build/bin -lpthread $(HOST_LDFLAGS)
 
 # the llama.cpp reference tools (ref/): logits and tensor dumps the exactness checks compare against
