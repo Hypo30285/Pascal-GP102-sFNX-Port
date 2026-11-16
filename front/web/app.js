@@ -100,7 +100,7 @@ async function loadHealth() {
     health = await (await fetch("health")).json();
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
-    $("chat-empty-sub").textContent = `${health.model} runs on this server's three V100s.`;
+    $("chat-empty-sub").textContent = `${health.model} runs on this server's Dual GP102 Pascal P6000/P40 GPUs.`;
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
