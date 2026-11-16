@@ -1,0 +1,54 @@
+{
+ "exe": "bin/sfnx",
+ "args": [
+  "--native",
+  "/mnt/storage_8tb_linux/models/gguf/Qwen3.8-27B-Q8_0/Qwen3.8-27B-Q8_0.gguf",
+  "--mtp",
+  "nextn",
+  "--draft-vocab",
+  "data/draft_vocab_en.bin",
+  "--max-context",
+  "131072",
+  "--spec",
+  "4",
+  "--lookup",
+  "15",
+  "--conversation-cache-mib",
+  "16384",
+  "--batch",
+  "2",
+  "--vision"
+ ],
+ "cwd": ".",
+ "env": {
+  "FNX_KV_RESERVE_MIB": "3072",
+  "FNX_SKIP_BAR1_CHECK": "1"
+ },
+ "tokenizer": "data/tokenizer",
+ "model_name": "qwen3.8-27b-q8_0-sfnx-sm61",
+ "log": "serve/sfnx-27b-z420.log",
+ "lib_dirs": [
+  "/mnt/nvme_storage/ai_projects/polystrata/.toolchain/bin",
+  "/mnt/nvme_storage/ai_projects/polystrata/.toolchain/lib64"
+ ],
+ "port": 8097,
+ "gpu": [
+  0,
+  1
+ ],
+ "sampling": {
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "presence_penalty": 1.0
+ },
+ "reasoning_close_retry": true,
+ "vision": {
+  "exe": "bin/sfnx-vision",
+  "cpu_exe": "bin/sfnx-vision",
+  "mmproj": "/mnt/storage_8tb_linux/models/gguf/Qwen3.8-27B-Q8_0/mmproj-F16.gguf",
+  "model": "/mnt/storage_8tb_linux/models/gguf/Qwen3.8-27B-Q8_0/Qwen3.8-27B-Q8_0.gguf",
+  "gpu": true,
+  "max_tokens": 1024,
+  "cuda_device": 0
+ }
+}

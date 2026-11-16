@@ -14,6 +14,13 @@
 .DEFAULT_GOAL := build
 .PHONY: build install test-bin ref trace
 CUDA ?= /usr/local/cuda
+# Z420 sm61-port: the host compilers (g++-14 upstream) and cuobjdump as variables, and for ARCH=61 the Ivy Bridge
+# host ISA (Xeon E5-2697 v2: AVX + F16C, no AVX2/FMA) so no host object can SIGILL there; z420_build.sh sets them
+HOSTCXX ?= g++-14
+# extra host link flags (Z420: the conda linker needs -rpath-link to llama.cpp's libraries and the driver's libcuda)
+HOST_LDFLAGS ?=
+HOSTCC ?= gcc-14
+CUOBJDUMP ?= $(CUDA)/bin/cuobjdump
 NVCC := $(CUDA)/bin/nvcc
 # 70 is prod's. 86 has run on RTX 3090s at a tester's (CUDA 12.9 there: with 12.8 and driver 595 the engine hung in
 # cudaGraphInstantiate); its numbers are theirs (docs/verification.md). 80, 89, 90, 100 and 120 compile (every object,
@@ -28,12 +35,12 @@ ARCH ?= 70
 override ARCH := $(strip $(ARCH))
 $(if $(word 2,$(ARCH)),$(error ARCH: one value, not '$(ARCH)'))
 $(if $(filter 75,$(ARCH)),$(error ARCH: 75 (Turing) gives a block 64 KB of shared memory, and the prompt path's recurrent kernel takes ~73 KB))
-$(if $(filter 70 80 86 89 90 100 120,$(ARCH)),,$(error ARCH: 70 (V100), 86 (RTX 3090), or 80, 89, 90, 100, 120 (build, never run); not '$(ARCH)'))
+$(if $(filter 61 70 80 86 89 90 100 120,$(ARCH)),,$(error ARCH: 61 (Pascal GP102, Z420 sm61-port), 70 (V100), 86 (RTX 3090), or 80, 89, 90, 100, 120 (build, never run); not '$(ARCH)'))
 ref: ref/fnx_ref ref/fnx_logref ref/img_logref ref/mmid_bench
 trace: tools/trace/libcupti_trace.so
 CUPTI := $(CUDA)/extras/CUPTI
 tools/trace/libcupti_trace.so: tools/trace/cupti_trace.cpp
-	g++-14 -O2 -std=c++17 -shared -fPIC -I$(CUPTI)/include -I$(CUDA)/include -o $@ $< \
+	$(HOSTCXX) -O2 -std=c++17 -shared -fPIC -I$(CUPTI)/include -I$(CUDA)/include -o $@ $< \
 	    -L$(CUPTI)/lib64 -Wl,-rpath,$(CUPTI)/lib64 -lcupti -lpthread
 # no built-in rules: with them make remakes an included build/kernels_p0.d by `%: %.o` from build/kernels_p0.d.o, which
 # the kernels_p% rule then compiles with FNX_KPART=0.d ("floating constant in preprocessor expression")
@@ -64,7 +71,7 @@ install: build
 # llama.cpp at a37cc46 (its ggml headers; its libraries for the picture encoder): a checkout in llama.cpp/, or LLAMA=path
 LLAMA ?= $(CURDIR)/llama.cpp
 GG := $(LLAMA)/ggml
-NVFLAGS := -DFNX_DIR='"$(CURDIR)"' -O3 --use_fast_math -std=c++17 -arch=sm_$(ARCH) -ccbin g++-14 -Wno-deprecated-gpu-targets -I$(GG)/src/ggml-cuda -I$(GG)/src -I$(GG)/include --expt-relaxed-constexpr
+NVFLAGS := -DFNX_DIR='"$(CURDIR)"' -O3 --use_fast_math -std=c++17 -arch=sm_$(ARCH) -ccbin $(HOSTCXX) -Wno-deprecated-gpu-targets -I$(GG)/src/ggml-cuda -I$(GG)/src -I$(GG)/include --expt-relaxed-constexpr
 # the cards every layer is split across (src/model.hpp): 3 (prod), or 2, 4, 6 or 8 (make FNX_NCARD=4 ...; the counts
 # the model's shapes divide by, src/card_split.hpp; above three untested on hardware). build/ncard holds the count the
 # objects in build/ were made for; a different count rewrites it, which rebuilds them all. It is written while make
@@ -75,6 +82,11 @@ override FNX_NCARD := $(strip $(FNX_NCARD))
 $(if $(word 2,$(FNX_NCARD)),$(error FNX_NCARD: one value, not '$(FNX_NCARD)'))
 $(if $(filter 2 3 4 6 8,$(FNX_NCARD)),,$(error FNX_NCARD: 2, 3, 4, 6 or 8 (the 24 query heads and 48 value heads split evenly, a 32-value FF block on every card, at most 8 for CUDA's peers a card), not '$(FNX_NCARD)'))
 NVFLAGS += -DFNX_NCARD=$(FNX_NCARD) -DFNX_ARCH=$(ARCH)
+ifeq ($(ARCH),61)
+HOST_ISA ?= -march=ivybridge -mtune=ivybridge -mavx -mf16c -mno-avx2 -mno-fma
+LLAMA_ISA ?= -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=ON -DGGML_AVX512=OFF
+endif
+NVFLAGS += $(if $(HOST_ISA),-Xcompiler "$(HOST_ISA)")
 # the model (src/model.hpp): fnx (Flash-Next, prod) or 27b (Qwen3.8-27B: src/s27_*, bin/s27_run). build/model holds
 # it as build/ncard holds the count; the 27B is built for two, three or four cards (src/s27_attn.cuh: every card reads
 # as many KV heads), other counts refused
@@ -107,25 +119,25 @@ $(call stamp,build/cuda,$(NVCC_ID))
 STAMPS := build/ncard build/arch build/cuda build/model
 
 bin/gguf_test: tools/gguf_test.cpp src/gguf.cpp src/gguf.hpp src/rope_gguf.hpp build/model
-	mkdir -p bin && g++-14 -O2 -std=c++17 -DFNX_27B=$(FNX_27B) -o $@ tools/gguf_test.cpp src/gguf.cpp
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -DFNX_27B=$(FNX_27B) -o $@ tools/gguf_test.cpp src/gguf.cpp
 bin/ple_test: tools/ple_test.cpp tools/ref_tokens.hpp src/ple_io.cpp src/ple_io.hpp src/env.hpp src/gguf.cpp src/gguf.hpp build/model
-	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -pthread -DFNX_27B=$(FNX_27B) -o $@ tools/ple_test.cpp src/ple_io.cpp src/gguf.cpp
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -Wall -pthread -DFNX_27B=$(FNX_27B) -o $@ tools/ple_test.cpp src/ple_io.cpp src/gguf.cpp
 bin/stage_test: tools/stage_test.cpp src/gguf.cpp src/gguf.hpp build/model
-	mkdir -p bin && g++-14 -O2 -std=c++17 -DFNX_27B=$(FNX_27B) -o $@ tools/stage_test.cpp src/gguf.cpp -lpthread
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -DFNX_27B=$(FNX_27B) -o $@ tools/stage_test.cpp src/gguf.cpp -lpthread
 bin/sfnx_input_test: tools/sfnx_input_test.cpp tools/sfnx_input.hpp
-	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -pthread -o $@ tools/sfnx_input_test.cpp
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -Wall -pthread -o $@ tools/sfnx_input_test.cpp
 # the batched drafts' row plan, on the CPU alone
 bin/batch_plan_test: tools/batch_plan_test.cpp src/batch_plan.hpp build/model
-	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_27B=$(FNX_27B) -o $@ tools/batch_plan_test.cpp
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -Wall -DFNX_27B=$(FNX_27B) -o $@ tools/batch_plan_test.cpp
 # the prompt path's ring plan against the two- and three-card sequences, and every supported count's sum, on the CPU
 bin/pf_ring_plan_test: tools/pf_ring_plan_test.cpp src/pf_ring_plan.hpp src/card_split.hpp src/model.hpp src/gguf.hpp build/ncard build/model
-	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -DFNX_27B=$(FNX_27B) -o $@ tools/pf_ring_plan_test.cpp
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -DFNX_27B=$(FNX_27B) -o $@ tools/pf_ring_plan_test.cpp
 # YaRN's band, angles and magnitude against ggml's, on the CPU alone
 bin/rope_test: tools/rope_test.cpp src/rope.hpp
-	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -o $@ tools/rope_test.cpp
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -Wall -o $@ tools/rope_test.cpp
 # the start-up card checks against real cards' numbers and sysfs text, on the CPU alone
 bin/card_check_test: tools/card_check_test.cpp src/card_check.hpp src/peer_probe.hpp src/model.hpp src/card_split.hpp src/gguf.hpp build/ncard build/model
-	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -DFNX_27B=$(FNX_27B) -o $@ tools/card_check_test.cpp
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -DFNX_27B=$(FNX_27B) -o $@ tools/card_check_test.cpp
 
 # one object per source in build/ (headers tracked by nvcc's own dependency files), so a change recompiles only the
 # objects it touches; every engine program and the lab's library link the same objects (position independent).
@@ -214,7 +226,7 @@ LU := $(LLAMA)
 # toolkit a box. The encoder is rebuilt with the engine's arch (build/arch)
 .PHONY: llama-check
 llama-check: $(LU)/build/bin/libmtmd.so
-	@lib=$(LU)/build/bin/libggml-cuda.so; dump=$(CUDA)/bin/cuobjdump; \
+	@lib=$(LU)/build/bin/libggml-cuda.so; dump=$(CUOBJDUMP); \
 	[ -x "$$dump" ] || { echo "llama-check: no cuobjdump at $$dump: CUDA=$(CUDA) is not a CUDA toolkit" >&2; exit 1; }; \
 	[ -f "$$lib" ] || { echo "llama-check: no $$lib: llama.cpp in $(LU)/build was built without CUDA (GGML_CUDA=ON)" >&2; exit 1; }; \
 	elf=$$("$$dump" --list-elf "$$lib") || { echo "llama-check: $$dump --list-elf $$lib failed" >&2; exit 1; }; \
@@ -236,22 +248,22 @@ llama-check: $(LU)/build/bin/libmtmd.so
 	[ -n "$$now" ] || { echo "llama-check: no version in $(NVCC) --version: '$$ver'" >&2; exit 1; }; \
 	[ "$$was" = "$$now" ] || { echo "llama-check: llama.cpp in $(LU)/build was configured with nvcc $$was ($$1), this build's $(NVCC) is $$now. CMake keeps the compiler it first found: move $(LU)/build aside and make builds it again with $(NVCC)" >&2; exit 1; }
 bin/sfnx-vision: vision/sfnx_vision.cpp vision/*.h $(LU)/build/bin/libmtmd.so build/arch | llama-check
-	mkdir -p bin && g++-14 -O2 -std=c++17 -I$(LU)/include -I$(GG)/include -I$(LU)/tools/mtmd -o $@ vision/sfnx_vision.cpp \
-	    -L$(LU)/build/bin -lmtmd -lllama -lggml -lggml-base -lggml-cpu -Wl,-rpath,$(LU)/build/bin -lpthread
+	mkdir -p bin && $(HOSTCXX) -O2 -std=c++17 -I$(LU)/include -I$(GG)/include -I$(LU)/tools/mtmd -o $@ vision/sfnx_vision.cpp \
+	    -L$(LU)/build/bin -lmtmd -lllama -lggml -lggml-base -lggml-cpu -Wl,-rpath,$(LU)/build/bin -lpthread $(HOST_LDFLAGS)
 
 # the llama.cpp reference tools (ref/): logits and tensor dumps the exactness checks compare against
-LLFLAGS = -O2 -std=c++17 -I$(LU)/include -I$(GG)/include -L$(LU)/build/bin -Wl,-rpath,$(LU)/build/bin
+LLFLAGS = -O2 -std=c++17 -I$(LU)/include -I$(GG)/include -L$(LU)/build/bin -Wl,-rpath,$(LU)/build/bin $(HOST_LDFLAGS)
 ref/fnx_ref ref/fnx_logref: ref/%: ref/%.cpp ref/logref_yarn.hpp src/env.hpp $(LU)/build/bin/libmtmd.so | llama-check
-	g++-14 $(LLFLAGS) -o $@ $< -lllama -lggml -lggml-base
+	$(HOSTCXX) $(LLFLAGS) -o $@ $< -lllama -lggml -lggml-base
 ref/img_logref: ref/img_logref.cpp ref/logref_yarn.hpp src/env.hpp $(LU)/build/bin/libmtmd.so | llama-check
-	g++-14 $(LLFLAGS) -I$(LU)/tools/mtmd -o $@ $< -lmtmd -lllama -lggml -lggml-base
+	$(HOSTCXX) $(LLFLAGS) -I$(LU)/tools/mtmd -o $@ $< -lmtmd -lllama -lggml -lggml-base
 ref/mmid_bench: ref/mmid_bench.cpp $(LU)/build/bin/libmtmd.so | llama-check
-	g++-14 $(LLFLAGS) -o $@ $< -lggml -lggml-base -lggml-cuda
+	$(HOSTCXX) $(LLFLAGS) -o $@ $< -lggml -lggml-base -lggml-cuda
 
 # llama.cpp's libraries, built in its own tree with CUDA for ARCH
 $(LU)/build/bin/libmtmd.so:
 	test -d $(LU)/.git || { echo "clone llama.cpp at a37cc46 into $(LU) first (or make LLAMA=path)" >&2; exit 1; }
 	cmake -S $(LU) -B $(LU)/build -G Ninja -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$(ARCH) -DCMAKE_BUILD_TYPE=Release \
-	    -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_CUDA_HOST_COMPILER=g++-14 \
+	    -DCMAKE_C_COMPILER=$(HOSTCC) -DCMAKE_CXX_COMPILER=$(HOSTCXX) -DCMAKE_CUDA_HOST_COMPILER=$(HOSTCXX) $(LLAMA_ISA) \
 	    -DCMAKE_CUDA_COMPILER=$(NVCC)
 	cmake --build $(LU)/build --target mtmd llama

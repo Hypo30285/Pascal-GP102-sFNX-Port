@@ -84,7 +84,7 @@ __device__ __forceinline__ void grid_sync(unsigned* bar, unsigned* err, unsigned
                 atomicOr(err, 4u);
                 break;
             }
-            __nanosleep(64);
+            fnx_nanosleep(64);
         }
         __threadfence();
     }

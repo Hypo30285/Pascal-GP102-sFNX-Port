@@ -1,6 +1,7 @@
 // The Engine (engine.hpp) for Qwen3.8-Flash-Next: its layers, its embeddings and its expert arena; what both models'
 // engines share is engine_common.cu's (engine_parts.hpp).
 #include <cstdlib>
+#include "sm61_compat.cuh"   // Z420 sm61-port
 #include "engine.hpp"
 #include "engine_parts.hpp"
 #include "env.hpp"
@@ -69,7 +70,7 @@ __global__ void ngram_wait_copy_k(const volatile unsigned* flag, const int* ctl,
                 atomicOr(err, 32u);
                 break;
             }
-            __nanosleep(256);
+            fnx_nanosleep(256);
         }
     }
     __syncthreads();

@@ -247,10 +247,14 @@ struct MmX {
 // d (each quad-pair's 8 x 8) += a (8 x 4, row-major: this lane's row, 4 halves in a0 a1) b (4 x 8, col-major: this
 // lane's column), f16 products with f32 accumulation: Volta's HMMA.884
 __device__ __forceinline__ void mma_884(float (&d)[8], unsigned a0, unsigned a1, unsigned b0, unsigned b1) {
+#if FNX_TC
     asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
                  "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
                  : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+#else
+    __trap();   // sm_61: no tensor cores; the 27B never launches this (src/sm61_compat.cuh)
+#endif
 }
 
 // the output staging's row stride in floats (8 past the tile: fewer conflicts than none or 16)
@@ -268,6 +272,7 @@ constexpr size_t mm_smem() { return std::max(sizeof(__half) * (BM + PF_JOB) * MM
 template <int TYPE, int BM>
 __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                         const __half* __restrict__ x, int ldx, float* __restrict__ out) {
+#if FNX_TC
     using namespace nvcuda;
     constexpr int WR = BM / 32, WT = MM_THREADS / 32 / WR, TT = 4 / WT, NP = BM / MM_PASS, LO = 16 * TT;
     static_assert(WR * WT == MM_THREADS / 32 && TT * WT == 4 && NP * MM_PASS == BM, "warp layout");
@@ -376,6 +381,9 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
         }
         out[(size_t) jb.out[j] * w.nrows + row] = v;
     }
+#else
+    __trap();   // sm_61: no tensor cores; the 27B never launches this (src/sm61_compat.cuh)
+#endif
 }
 
 // h = silu(gate) * up of the stacked gate|up rows, rounded to f16 (llama.cpp's swiglu output, converted for cuBLAS)

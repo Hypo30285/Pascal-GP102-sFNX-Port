@@ -161,6 +161,7 @@ __global__ void __launch_bounds__(256) k_idx_score(const float* __restrict__ q, 
 constexpr int QSC_ROWS = 16, QSC_KEYS = 64, QSC_LD = QSA_DIM + 8, QSC_SLD = 16 + 4;
 __global__ void __launch_bounds__(256) k_idx_score_tc(const float* __restrict__ q, const __half* __restrict__ pooled, KvPages g,
                                                       float* __restrict__ scores, int max_pools, const int* pos0p, int T) {
+#if FNX_TC
     using namespace nvcuda;
     const int t0 = blockIdx.y * QSC_ROWS, j0 = blockIdx.x * QSC_KEYS, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int tl = min(T, t0 + QSC_ROWS) - 1;   // the block's last row sees the most blocks
@@ -208,6 +209,9 @@ __global__ void __launch_bounds__(256) k_idx_score_tc(const float* __restrict__ 
         }
         __syncwarp();
     }
+#else
+    __trap();   // sm_61: no tensor cores; the 27B never launches this (src/sm61_compat.cuh)
+#endif
 }
 
 // row t's attended positions on this card (block j owned by card kv_card(j)), as local indices kv_local_block(j) * 4 + p % 4, ascending,
@@ -236,7 +240,7 @@ __global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select(const float* __r
             const unsigned k = j < nv ? key[j] : 0u;
             const bool in = j < nv && (k & mask) == prefix;
             const unsigned bin = in ? (k >> shift) & 255u : 256u;
-            const unsigned peers = __match_any_sync(0xffffffffu, bin);
+            const unsigned peers = fnx_match_any(0xffffffffu, bin);
             if (in && (tid & 31) == __ffs(peers) - 1) atomicAdd(&hist[bin], (unsigned) __popc(peers));
         }
         __syncthreads();

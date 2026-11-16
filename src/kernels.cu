@@ -7,6 +7,8 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 
+#include "sm61_compat.cuh"   // Z420 sm61-port: Pascal shims (nanosleep, match_any, FNX_TC)
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -1826,7 +1828,20 @@ void gdn_prompt(const float* qkvz, const float* ab, float* hist, const float* co
         if (e && std::strcmp(e, "0") && std::strcmp(e, "1")) throw std::runtime_error(std::string("FNX_PF_GDN_CHUNK: 0 or 1, not '") + e + "'");
         return !e || !std::strcmp(e, "1");
     }();
-    if (chunked) {
+    // Z420 sm61-port: k_gdn_ch_rec takes GCH_REC_SMEM (~73 KB) of shared memory a block; a card that cannot give a
+    // block that much (Pascal sm_61: 48 KB) takes the row-by-row kernel (FNX_PF_GDN_CHUNK=0's path) instead
+    static int fits[16] = {};   // 0 unknown, 1 fits, -1 does not
+    int cur = 0;
+    cudaGetDevice(&cur);
+    if (chunked && !fits[cur]) {
+        int optin = 0;
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, cur);
+        fits[cur] = (size_t) optin >= GCH_REC_SMEM ? 1 : -1;
+        if (fits[cur] < 0)
+            std::fprintf(stderr, "gdn_prompt: card %d gives a block %d bytes of shared memory, the sub-chunk kernel takes %zu: "
+                                 "the row-by-row recurrence instead\n", cur, optin, GCH_REC_SMEM);
+    }
+    if (chunked && fits[cur] > 0) {
         static thread_local bool smem_set[16] = {};
         int dev = 0;
         cudaGetDevice(&dev);

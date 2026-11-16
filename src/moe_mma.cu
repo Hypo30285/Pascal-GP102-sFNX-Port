@@ -6,6 +6,8 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 
+#include "sm61_compat.cuh"   // Z420 sm61-port: Pascal shims (nanosleep, match_any, FNX_TC)
+
 #include <algorithm>
 #include <stdexcept>
 #include <string>

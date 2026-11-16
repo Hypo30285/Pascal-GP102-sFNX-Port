@@ -22,6 +22,7 @@ __global__ void __launch_bounds__(AP_THREADS) k_pf_attn(const float* __restrict_
                                                         const __half* __restrict__ vc, KvPages g, const int* __restrict__ pos0p,
                                                         const int* __restrict__ cells, const int* __restrict__ n_cells, int card,
                                                         int C, int r0, float* __restrict__ part) {
+#if FNX_TC
     using namespace nvcuda;
     extern __shared__ __align__(16) unsigned char ap_smem[];
     __half* qh = reinterpret_cast<__half*>(ap_smem);           // [16][AP_LD]
@@ -184,6 +185,9 @@ __global__ void __launch_bounds__(AP_THREADS) k_pf_attn(const float* __restrict_
             dst[HD + 1] = sz[orow];
         }
     }
+#else
+    __trap();   // sm_61: no tensor cores; the 27B never launches this (src/sm61_compat.cuh)
+#endif
 }
 
 // this card's heads: its own partial and the others' (from card g + 1 in slot 0, g + 2 in slot 1, ...), merged; the gate
