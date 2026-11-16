@@ -92,69 +92,110 @@ static __global__ void __launch_bounds__(HD) k_s27_prep(float* qkv, int row_stri
     else pool[s27_k(pt, slot, pos) + (h - S27_NQ) * HD + i] = __float2half_rn(x[i]);
 }
 
-// per (split, row, head): the split's share of the row's positions [0, pos], four warps over them, each lane 8 values
-// of the head; the split's max, sum and weighted values into part ([T][NQ][S27_ASPLIT] of HD + 2)
-static __global__ void __launch_bounds__(128) k_s27_attn(const float* qkv, int row_stride, const __half* pool, int slot, const int* pos0p,
-                                                  const int* pt0, LaneRows lr, int kvh0, int q0, float* part) {
-    const int s = blockIdx.x, t = blockIdx.y, h = blockIdx.z, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+// per (split, row, local KV head): the split's share of the row's positions [0, pos], four warps over them, each lane 8
+// values of the head; K and V loaded once from the paged pool and shared across all GQA query heads of that KV head on
+// this card (up to S27_QPK = 6 heads); each head's max, sum and weighted values into part ([T][NQ][S27_ASPLIT] of HD + 2)
+constexpr int S27_QPK = NQH / NKVH;
+static __global__ void __launch_bounds__(128, 3) k_s27_attn(const float* qkv, int row_stride, const __half* pool, int slot, const int* pos0p,
+                                                     const int* pt0, LaneRows lr, int kvh0, int q0, float* part) {
+    const int s = blockIdx.x, t = blockIdx.y, kvh = blockIdx.z, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int len = s27_row_pos(lr, pos0p, t) + 1, chunk = (len + S27_ASPLIT - 1) / S27_ASPLIT;
     const int* pt = s27_row_pt(lr, pt0, t);
     const int p0 = s * chunk, p1 = min(len, p0 + chunk);
-    const int kvh = (q0 + h) / (NQH / NKVH) - kvh0;
-    const float* q = qkv + (size_t) t * row_stride + h * 2 * HD + lane * 8;
-    float qv[8];
+    const int h0 = max(0, (kvh0 + kvh) * S27_QPK - q0);
+    const int h1 = min(S27_NQ, (kvh0 + kvh + 1) * S27_QPK - q0);
+    const int nh = h1 - h0;
+
+    __shared__ union {
+        float sq[S27_QPK][8][32];
+        struct {
+            float wm[4], wl[4], wa[4][HD];
+        } red;
+    } smem;
+    const float* qrow = qkv + (size_t) t * row_stride;
+    for (int hh = 0; hh < nh; ++hh) {
+        for (int idx = threadIdx.x; idx < HD; idx += 128)
+            smem.sq[hh][idx & 7][idx >> 3] = qrow[(h0 + hh) * 2 * HD + idx] * 0.0625f;   // 1 / sqrt(HD)
+    }
+    __syncthreads();
+
+    float m[S27_QPK], l[S27_QPK], acc[S27_QPK][8];
 #pragma unroll
-    for (int j = 0; j < 8; ++j) qv[j] = q[j] * 0.0625f;   // 1 / sqrt(HD)
-    float m = -INFINITY, l = 0.f, acc[8] = {};
+    for (int hh = 0; hh < S27_QPK; ++hh) {
+        m[hh] = -INFINITY;
+        l[hh] = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[hh][j] = 0.f;
+    }
+
     for (int p = p0 + warp; p < p1; p += 4) {
         const size_t at = s27_k(pt, slot, p) + kvh * HD + lane * 8;
         const uint4 kr = *reinterpret_cast<const uint4*>(pool + at);
         const __half2* k2 = reinterpret_cast<const __half2*>(&kr);
-        float d = 0.f;
+        float kf[8];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const float2 f = __half22float2(k2[j]);
-            d = fmaf(qv[2 * j], f.x, fmaf(qv[2 * j + 1], f.y, d));
+            kf[2 * j] = f.x;
+            kf[2 * j + 1] = f.y;
         }
-#pragma unroll
-        for (int o = 16; o; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
-        const float mn = fmaxf(m, d), c = __expf(m - mn), e = __expf(d - mn);
         const uint4 vr = *reinterpret_cast<const uint4*>(pool + at + (size_t) S27_PP * S27_ROWH);
         const __half2* v2 = reinterpret_cast<const __half2*>(&vr);
-        l = l * c + e;
+        float vf[8];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const float2 f = __half22float2(v2[j]);
-            acc[2 * j] = fmaf(acc[2 * j], c, e * f.x);
-            acc[2 * j + 1] = fmaf(acc[2 * j + 1], c, e * f.y);
+            vf[2 * j] = f.x;
+            vf[2 * j + 1] = f.y;
         }
-        m = mn;
-    }
-    __shared__ float wm[4], wl[4], wa[4][HD];
-    if (lane == 0) wm[warp] = m, wl[warp] = l;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) wa[warp][lane * 8 + j] = acc[j];
-    __syncthreads();
-    float M = -INFINITY;
-    for (int w = 0; w < 4; ++w) M = fmaxf(M, wm[w]);
-    float* out = part + (((size_t) t * S27_NQ + h) * S27_ASPLIT + s) * (HD + 2);
-    for (int d = threadIdx.x; d < HD; d += blockDim.x) {
-        float a = 0.f;
-        if (M != -INFINITY)
-            for (int w = 0; w < 4; ++w) a += wa[w][d] * __expf(wm[w] - M);
-        out[d] = a;
+        for (int hh = 0; hh < S27_QPK; ++hh) {
+            if (hh >= nh) break;
+            float d = 0.f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) d = fmaf(smem.sq[hh][j][lane], kf[j], d);
+#pragma unroll
+            for (int o = 16; o; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+            const float mn = fmaxf(m[hh], d), c = __expf(m[hh] - mn), e = __expf(d - mn);
+            l[hh] = l[hh] * c + e;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) acc[hh][j] = fmaf(acc[hh][j], c, e * vf[j]);
+            m[hh] = mn;
+        }
     }
-    if (threadIdx.x == 0) {
-        float L = 0.f;
-        if (M != -INFINITY)
-            for (int w = 0; w < 4; ++w) L += wl[w] * __expf(wm[w] - M);
-        out[HD] = M;
-        out[HD + 1] = L;
+
+#pragma unroll
+    for (int hh = 0; hh < S27_QPK; ++hh) {
+        if (hh >= nh) break;
+        __syncthreads();
+        if (lane == 0) smem.red.wm[warp] = m[hh], smem.red.wl[warp] = l[hh];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) smem.red.wa[warp][lane * 8 + j] = acc[hh][j];
+        __syncthreads();
+        float M = -INFINITY;
+        for (int w = 0; w < 4; ++w) M = fmaxf(M, smem.red.wm[w]);
+        const int h = h0 + hh;
+        float* out = part + (((size_t) t * S27_NQ + h) * S27_ASPLIT + s) * (HD + 2);
+        for (int d = threadIdx.x; d < HD; d += blockDim.x) {
+            float a = 0.f;
+            if (M != -INFINITY)
+                for (int w = 0; w < 4; ++w) a += smem.red.wa[w][d] * __expf(smem.red.wm[w] - M);
+            out[d] = a;
+        }
+        if (threadIdx.x == 0) {
+            float L = 0.f;
+            if (M != -INFINITY)
+                for (int w = 0; w < 4; ++w) L += smem.red.wl[w] * __expf(smem.red.wm[w] - M);
+            out[HD] = M;
+            out[HD + 1] = L;
+        }
     }
 }
 
-// per (row, head): the splits merged, gated by sigmoid(gate), into att [T][NQ][HD]
-static __global__ void __launch_bounds__(HD) k_s27_merge(const float* qkv, int row_stride, const float* part, float* att) {
+// per (row, head): the splits merged, gated by sigmoid(gate), into att [T][NQ][HD]; with tq, also quantized into the
+// split twin (tq, td) of a q8_1 buffer of S27_NQ * HD-wide rows so wo's q8s_gemv needs no separate quantize_q8_1 launch
+static __global__ void __launch_bounds__(HD) k_s27_merge(const float* qkv, int row_stride, const float* part, float* att,
+                                                         int8_t* tq = nullptr, float* td = nullptr) {
     const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const float* ps = part + ((size_t) t * S27_NQ + h) * S27_ASPLIT * (HD + 2);
     float M = -INFINITY;
@@ -168,7 +209,18 @@ static __global__ void __launch_bounds__(HD) k_s27_merge(const float* qkv, int r
         L = fmaf(p[HD + 1], e, L);
     }
     const float g = qkv[(size_t) t * row_stride + h * 2 * HD + HD + d];
-    att[((size_t) t * S27_NQ + h) * HD + d] = a / L / (1.f + __expf(-g));
+    const float v = a / L / (1.f + __expf(-g));
+    const size_t idx = ((size_t) t * S27_NQ + h) * HD + d;
+    att[idx] = v;
+    if (tq) {
+        float amax = fabsf(v);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const float sc = amax / 127.0f;
+        tq[idx] = amax == 0.0f ? 0 : (int8_t) roundf(v / sc);
+        if ((d & 31) == 0)
+            td[(size_t) t * (S27_NQ * HD / 32) + h * (HD / 32) + (d >> 5)] = __half2float(__float2half(sc));
+    }
 }
 
 }  // namespace fnx

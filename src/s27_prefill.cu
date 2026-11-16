@@ -299,6 +299,12 @@ void pf_dense(Engine::Pf& p, const DW& w, const __half* X, int C, float* out) {
         if (C <= 16) {
             const dim3 grid((rows + 63) / 64, 1);
             k_pf_q8s_dp4a<16, 1><<<grid, 256, 0, p.st>>>(w.s.q, w.s.d, xq, xd, out, rows, cols, C, rows);
+        } else if (C <= 32) {
+            const dim3 grid((rows + 63) / 64, 1);
+            k_pf_q8s_dp4a<32, 2><<<grid, 256, 0, p.st>>>(w.s.q, w.s.d, xq, xd, out, rows, cols, C, rows);
+        } else if (C <= 48) {
+            const dim3 grid((rows + 63) / 64, 1);
+            k_pf_q8s_dp4a<48, 3><<<grid, 256, 0, p.st>>>(w.s.q, w.s.d, xq, xd, out, rows, cols, C, rows);
         } else {
             const dim3 grid((rows + 63) / 64, (C + 63) / 64);
             k_pf_q8s_dp4a<64, 4><<<grid, 256, 0, p.st>>>(w.s.q, w.s.d, xq, xd, out, rows, cols, C, rows);

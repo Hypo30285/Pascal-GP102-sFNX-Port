@@ -57,17 +57,29 @@ void add_norm(CardBuf& b, float* R, const float* pend, const float* w, int T, fl
     k_add_norm<<<T, 1024, 0, b.st>>>(R, pend, w, b.mixed, twin ? b.xtq : nullptr, twin ? b.xtd : nullptr, eps);
     ck(cudaGetLastError(), "add_norm");
 }
-// out[t] = [rms(e[t]) * we | rms(h[t]) * wh]: the draft layer's input before its projection
-__global__ void k_norm_cat(const float* e, const float* h, const float* we, const float* wh, float* out, float eps) {
+// out[t] = [rms(e[t]) * we | rms(h[t]) * wh]: the draft layer's input before its projection; with tq, also quantized
+// into the split twin (tq, td) of a q8_1 buffer of 2N-wide rows
+__global__ void k_norm_cat(const float* e, const float* h, const float* we, const float* wh, float* out, int8_t* tq, float* td, float eps) {
     __shared__ float sh[32];
-    const int t = blockIdx.x;
+    const int t = blockIdx.x, lane = threadIdx.x & 31;
     const float* x[2] = {e + (size_t) t * N, h + (size_t) t * N};
     const float* w[2] = {we, wh};
     for (int s = 0; s < 2; ++s) {
         float q = 0.f;
         for (int i = threadIdx.x; i < N; i += blockDim.x) q += x[s][i] * x[s][i];
         const float r = rsqrtf(s27_block_sum(q, sh) / (float) N + eps);
-        for (int i = threadIdx.x; i < N; i += blockDim.x) out[(size_t) t * 2 * N + s * N + i] = x[s][i] * r * w[s][i];
+        for (int bl = threadIdx.x >> 5; bl < N / 32; bl += blockDim.x >> 5) {
+            const int i = bl * 32 + lane;
+            const float v = x[s][i] * r * w[s][i];
+            const size_t idx = (size_t) t * 2 * N + s * N + i;
+            out[idx] = v;
+            if (!tq) continue;
+            float amax = fabsf(v);
+            for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            const float d = amax / 127.0f;
+            tq[idx] = amax == 0.0f ? 0 : (int8_t) roundf(v / d);
+            if (lane == 0) td[(size_t) t * (2 * N / 32) + s * (N / 32) + bl] = __half2float(__float2half(d));
+        }
     }
 }
 
@@ -110,10 +122,9 @@ void attn_half(CardBuf& b, const LayerW& L, float* R, bool pend, int slot, const
     mv(b, L.wq, b.xq, b.qkv, T);
     k_s27_prep<<<dim3(S27_NQ + 2 * S27_NKV, T), HD, 0, b.st>>>(b.qkv, S27_QKV, L.q_norm, L.k_norm, b.pool, slot, rows.ctl, b.pt, rows.lr,
                                                                 rows.tabs, eps, rope);
-    k_s27_attn<<<dim3(S27_ASPLIT, T, S27_NQ), 128, 0, b.st>>>(b.qkv, S27_QKV, b.pool, slot, rows.ctl, b.pt, rows.lr, kv0, q0, b.apart);
-    k_s27_merge<<<dim3(T, S27_NQ), HD, 0, b.st>>>(b.qkv, S27_QKV, b.apart, b.att);
+    k_s27_attn<<<dim3(S27_ASPLIT, T, S27_NKV), 128, 0, b.st>>>(b.qkv, S27_QKV, b.pool, slot, rows.ctl, b.pt, rows.lr, kv0, q0, b.apart);
+    k_s27_merge<<<dim3(T, S27_NQ), HD, 0, b.st>>>(b.qkv, S27_QKV, b.apart, b.att, b.xtq, b.xtd);
     ck(cudaGetLastError(), "attention");
-    quantize_q8_1(b.att, b.xq, S27_NQ * HD, T, b.st);
     mv(b, L.wo, b.xq, b.bo, T);
     sum_cards(b, b.bo, T, rows.ctl, call);
 }
@@ -178,9 +189,9 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             }
         ck(cudaStreamCreateWithFlags(&b->st, cudaStreamNonBlocking), "stream");
         own_stream(b->st);
-        ck(cudaEventCreate(&b->ev0), "event");
+        ck(cudaEventCreateWithFlags(&b->ev0, cudaEventBlockingSync), "event");
         own_event(b->ev0);
-        ck(cudaEventCreate(&b->ev1), "event");
+        ck(cudaEventCreateWithFlags(&b->ev1, cudaEventBlockingSync), "event");
         own_event(b->ev1);
         if (w.nq != S27_NQ || w.nkv != S27_NKV || w.q0 != c * S27_NQ || w.kv0 != w.q0 / (NQH / NKVH) || w.L[3].wq.n_out != S27_QKV)
             throw std::runtime_error("27b: card " + std::to_string(c) + "'s attention heads are not the split s27_attn.cuh runs");
@@ -635,9 +646,8 @@ void Engine::mtp_enqueue(int T) {
         CardBuf& b = *cb_[c];
         const CardW& w = m_.cards[c];
         ck(cudaSetDevice(b.dev), "set");
-        k_norm_cat<<<T, 1024, 0, b.st>>>(b.mtp_emb, b.mtp_src, w.mtp_enorm, w.mtp_hnorm, b.mtp_cat, eps);
+        k_norm_cat<<<T, 1024, 0, b.st>>>(b.mtp_emb, b.mtp_src, w.mtp_enorm, w.mtp_hnorm, b.mtp_cat, b.xtq, b.xtd, eps);
         ck(cudaGetLastError(), "norm_cat");
-        quantize_q8_1(b.mtp_cat, b.xq, 2 * N, T, b.st);
         mv(b, w.mtp_eh, b.xq, b.mtp_R, T);
         attn_half(b, w.mtp, b.mtp_R, false, S27_SLOTS - 1, Rows{b.mtp_ctl, LaneRows{}, nullptr}, w.q0, w.kv0, 0, T, eps, rope_of(b.mrope));
     }

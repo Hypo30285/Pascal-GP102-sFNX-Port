@@ -2091,10 +2091,9 @@ void q8s_run(const Q8Segs& g, int rows, int cols, const void* y, int T, void* st
         q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
     } else {
 #if FNX_27B
-        // up to 4 rows by the window (the 27B's windows, bin/s27_run S27_BENCH=1: 1 row 19.4 -> 18.3 ms, 4 rows
-        // 24.5 -> 22.3), past that by the matrix (5 to 16 rows: choosing by the window was no faster)
+        // up to 2 rows by the window (2 rows per warp), 3..16 rows by the matrix (4 rows per warp for >=8192 rows with
+        // TC=4 weight sharing in dense.cuh, 2 rows per warp for >=4096 rows)
         if (T <= 2) q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
-        else if (T <= 4) q8s_launch<1, SEG>(g, rows, cols, yq, T, s);
         else if (rows >= 8192) q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
 #else
         if (rows >= 8192) q8s_launch<4, SEG>(g, rows, cols, yq, T, s);

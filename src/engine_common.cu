@@ -770,6 +770,7 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
     unsigned err = 0;
     float gpu_ms = 0.f;
     each([&](int c, CardBuf& b, const CardW&) {
+        ck(cudaEventSynchronize(b.ev1), "window sync");
         ck(cudaStreamSynchronize(b.st), "window sync");
         err |= h_.err[c];
         float ms = 0.f;
@@ -890,6 +891,7 @@ std::vector<int> Engine::step(const std::vector<int>& lanes, const std::vector<i
     unsigned err = 0;
     float gpu_ms = 0.f;
     each([&](int c, CardBuf& b, const CardW&) {
+        ck(cudaEventSynchronize(b.ev1), "step sync");
         ck(cudaStreamSynchronize(b.st), "step sync");
         err |= h_.err[c];
         float ms = 0.f;
@@ -1096,6 +1098,7 @@ std::vector<int> Engine::verify_rows(const std::vector<int>& lanes, const std::v
     unsigned err = 0;
     float gpu_ms = 0.f;
     each([&](int c, CardBuf& b, const CardW&) {
+        ck(cudaEventSynchronize(b.ev1), "verify_rows sync");
         ck(cudaStreamSynchronize(b.st), "verify_rows sync");
         err |= h_.err[c];
         float ms = 0.f;
@@ -1280,6 +1283,7 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
     float gpu_ms = 0.f;
     for (int c = 0; c < NCARD; ++c) {
         ck(cudaSetDevice(cb_[c]->dev), "set");
+        ck(cudaEventSynchronize(cb_[c]->ev1), "draft sync");
         ck(cudaStreamSynchronize(cb_[c]->st), "draft sync");
         err |= h_.err[c];
         float ms = 0.f;
