@@ -140,7 +140,6 @@ __global__ void k_pf_gate(const float* __restrict__ O, const float* __restrict__
         att[t * S27_NQ * HD + h * HD + d] = __float2half(O[e] / (1.f + __expf(-g)));
     }
 }
-constexpr unsigned PF_SEQ_RESET = 1u << 31;
 constexpr int PF_K = 2;   // chunks a pass: one's sums cross the links while the other computes
 }  // namespace
 

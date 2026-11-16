@@ -58,7 +58,7 @@ struct CardBuf {
     void* hq = nullptr;     // the FFN's swiglu as q8_1 rows of the card's FF slice, with its twin
     float *qkvz = nullptr, *ab = nullptr, *gdn_scratch = nullptr;
     float* qkv = nullptr;   // [T][S27_QKV]: the card's q | gate heads, K heads, V heads
-    float *att = nullptr, *apart = nullptr;
+    float* apart = nullptr;
     float* gu = nullptr;
     float* head_logits = nullptr;
     int *tk_pen_tok = nullptr, *tk_pen_cnt = nullptr, *tk_pen_n = nullptr, *tk_i = nullptr;   // top_tokens()
@@ -102,8 +102,8 @@ struct CardBuf {
     CopyJob* rows_commit_jobs = nullptr;
     CopyJob* commit_jobs = nullptr;
     cudaEvent_t commit_ev = nullptr, rows_commit_ev = nullptr;
-    // the draft layer: its token rows, source rows, [e | h] normed, residual, outputs after the head norm, head logits
-    float *mtp_emb = nullptr, *mtp_src = nullptr, *mtp_cat = nullptr, *mtp_R = nullptr, *mtp_out = nullptr,
+    // the draft layer: its token rows, source rows, residual, outputs after the head norm, head logits
+    float *mtp_emb = nullptr, *mtp_src = nullptr, *mtp_R = nullptr, *mtp_out = nullptr,
           *mtp_logits = nullptr, *mtp_bv = nullptr;
     int *mtp_bi = nullptr, *mtp_ctl = nullptr;
     int* mtp_pen = nullptr;           // the last row's penalties (penalize_row's pen, this card's draft-vocabulary indexes)

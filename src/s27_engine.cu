@@ -28,9 +28,11 @@
 namespace fnx {
 
 namespace {
-// R[t] += pend[t] (a half's sum, when pend is not null), then y[t] = rms(R[t]) * w: the next half's input; with tq, also
-// quantized as quantize_q8_1 does into the split twin (tq, td) of a q8_1 buffer of N-wide rows, which is all q8s reads
-__global__ void k_add_norm(float* R, const float* pend, const float* w, float* y, int8_t* tq, float* td, float eps) {
+// R[t] += pend[t] (a half's sum, when pend is not null), then y[t] = rms(R[t]) * w (when y is not null): the next
+// half's input; with tq, also quantized as quantize_q8_1 does into the split twin (tq, td) of a q8_1 buffer of N-wide
+// rows (or only the last row into row 0 of the twin when last_only is set, for the draft head), which is all q8s reads
+__global__ void k_add_norm(float* R, const float* pend, const float* w, float* y, int8_t* tq, float* td, float eps,
+                           bool last_only = false) {
     __shared__ float sh[32];
     float* r = R + (size_t) blockIdx.x * N;
     float q = 0.f;
@@ -41,25 +43,28 @@ __global__ void k_add_norm(float* R, const float* pend, const float* w, float* y
     }
     const float s = rsqrtf(s27_block_sum(q, sh) / (float) N + eps);
     const int lane = threadIdx.x & 31;
+    const bool do_tq = tq && (!last_only || blockIdx.x + 1 == gridDim.x);
+    const size_t qr = last_only ? 0 : (size_t) blockIdx.x;
     for (int bl = threadIdx.x >> 5; bl < N / 32; bl += blockDim.x >> 5) {
         const int i = bl * 32 + lane;
         const float v = r[i] * s * w[i];
-        y[(size_t) blockIdx.x * N + i] = v;
-        if (!tq) continue;
+        if (y) y[(size_t) blockIdx.x * N + i] = v;
+        if (!do_tq) continue;
         float amax = fabsf(v);
         for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
         const float d = amax / 127.0f;
-        tq[(size_t) blockIdx.x * N + i] = amax == 0.0f ? 0 : (int8_t) roundf(v / d);
-        if (lane == 0) td[(size_t) blockIdx.x * (N / 32) + bl] = __half2float(__float2half(d));
+        tq[qr * N + i] = amax == 0.0f ? 0 : (int8_t) roundf(v / d);
+        if (lane == 0) td[qr * (N / 32) + bl] = __half2float(__float2half(d));
     }
 }
-void add_norm(CardBuf& b, float* R, const float* pend, const float* w, int T, float eps, bool twin) {
-    k_add_norm<<<T, 1024, 0, b.st>>>(R, pend, w, b.mixed, twin ? b.xtq : nullptr, twin ? b.xtd : nullptr, eps);
+void add_norm(CardBuf& b, float* R, const float* pend, const float* w, float* y, int T, float eps, bool twin,
+              bool last_only = false) {
+    k_add_norm<<<T, 1024, 0, b.st>>>(R, pend, w, y, twin ? b.xtq : nullptr, twin ? b.xtd : nullptr, eps, last_only);
     ck(cudaGetLastError(), "add_norm");
 }
-// out[t] = [rms(e[t]) * we | rms(h[t]) * wh]: the draft layer's input before its projection; with tq, also quantized
-// into the split twin (tq, td) of a q8_1 buffer of 2N-wide rows
-__global__ void k_norm_cat(const float* e, const float* h, const float* we, const float* wh, float* out, int8_t* tq, float* td, float eps) {
+// [rms(e[t]) * we | rms(h[t]) * wh] quantized directly into the split twin (tq, td) of a q8_1 buffer of 2N-wide rows:
+// the draft layer's input before its projection
+__global__ void k_norm_cat(const float* e, const float* h, const float* we, const float* wh, int8_t* tq, float* td, float eps) {
     __shared__ float sh[32];
     const int t = blockIdx.x, lane = threadIdx.x & 31;
     const float* x[2] = {e + (size_t) t * N, h + (size_t) t * N};
@@ -72,8 +77,6 @@ __global__ void k_norm_cat(const float* e, const float* h, const float* we, cons
             const int i = bl * 32 + lane;
             const float v = x[s][i] * r * w[s][i];
             const size_t idx = (size_t) t * 2 * N + s * N + i;
-            out[idx] = v;
-            if (!tq) continue;
             float amax = fabsf(v);
             for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
             const float d = amax / 127.0f;
@@ -118,12 +121,12 @@ struct Rows {
 // wo, summed across the cards into b.bo (folded into R by the next half)
 void attn_half(CardBuf& b, const LayerW& L, float* R, bool pend, int slot, const Rows& rows, int q0, int kv0, int call, int T, float eps,
                const Rope& rope) {
-    add_norm(b, R, pend ? b.bo : nullptr, L.attn_norm, T, eps, true);
+    add_norm(b, R, pend ? b.bo : nullptr, L.attn_norm, nullptr, T, eps, true);
     mv(b, L.wq, b.xq, b.qkv, T);
     k_s27_prep<<<dim3(S27_NQ + 2 * S27_NKV, T), HD, 0, b.st>>>(b.qkv, S27_QKV, L.q_norm, L.k_norm, b.pool, slot, rows.ctl, b.pt, rows.lr,
                                                                 rows.tabs, eps, rope);
     k_s27_attn<<<dim3(S27_ASPLIT, T, S27_NKV), 128, 0, b.st>>>(b.qkv, S27_QKV, b.pool, slot, rows.ctl, b.pt, rows.lr, kv0, q0, b.apart);
-    k_s27_merge<<<dim3(T, S27_NQ), HD, 0, b.st>>>(b.qkv, S27_QKV, b.apart, b.att, b.xtq, b.xtd);
+    k_s27_merge<<<dim3(T, S27_NQ), HD, 0, b.st>>>(b.qkv, S27_QKV, b.apart, b.xtq, b.xtd);
     ck(cudaGetLastError(), "attention");
     mv(b, L.wo, b.xq, b.bo, T);
     sum_cards(b, b.bo, T, rows.ctl, call);
@@ -131,7 +134,7 @@ void attn_half(CardBuf& b, const LayerW& L, float* R, bool pend, int slot, const
 
 void ffn27(CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl, int call, int T, float eps) {
     const int ffs = w.fd1 - w.fd0;
-    add_norm(b, R, b.bo, L.ffn_norm, T, eps, true);
+    add_norm(b, R, b.bo, L.ffn_norm, nullptr, T, eps, true);
     mv(b, L.ffn_gu, b.xq, b.gu, T);
     swiglu_stacked_q8_1(b.gu, b.hq, ffs, T, b.st);
     mv(b, L.ffn_down, b.hq, b.bo, T);
@@ -211,7 +214,6 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->ab = dalloc<float>((size_t) MAXT * 2 * w.nv());
         b->gdn_scratch = dalloc<float>(gdn_scratch_floats(w.nv()));
         b->qkv = dalloc<float>((size_t) MAXT * S27_QKV);
-        b->att = dalloc<float>((size_t) MAXT * S27_NQ * HD);
         b->apart = dalloc<float>((size_t) MAXT * S27_NQ * S27_ASPLIT * (HD + 2));
         b->gu = dalloc<float>((size_t) MAXT * 2 * ffs);
         b->head_logits = dalloc<float>((size_t) MAXT * (w.v1 - w.v0));
@@ -521,7 +523,7 @@ void Engine::enqueue_layers(int T, bool lanes, const GdnFn& gdn, bool dumps) {
             const LayerW& L = w.L[l];
             if (!is_attn(l)) {
                 const int nv = w.nv();
-                add_norm(b, b.R, l > 0 ? b.bo : nullptr, L.attn_norm, T, eps, true);
+                add_norm(b, b.R, l > 0 ? b.bo : nullptr, L.attn_norm, b.mixed, T, eps, true);
                 q8s_gemv_f32(L.qkvz.s, L.qkvz.n_out, L.qkvz.n_in, b.xq, b.qkvz, L.ab, b.mixed, b.ab, 2 * nv, T, b.st);
                 gdn(b, w, L, l);
                 mv(b, L.ssm_out, b.xq, b.bo, T);
@@ -537,8 +539,7 @@ void Engine::enqueue_layers(int T, bool lanes, const GdnFn& gdn, bool dumps) {
         dd("ffn_out", l, cb_[0]->bo, N);
     }
     each([&](int, CardBuf& b, const CardW& w) {
-        add_norm(b, b.R, b.bo, w.out_norm, T, eps, true);
-        ck(cudaMemcpyAsync(b.hfin, b.mixed, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, b.st), "hfin");
+        add_norm(b, b.R, b.bo, w.out_norm, b.hfin, T, eps, true);
         mv(b, w.out, b.xq, b.head_logits, T);
         argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.err, b.st);
     });
@@ -604,7 +605,6 @@ void Engine::mtp_attach(const Mtp& mtp) {
         ck(cudaSetDevice(b.dev), "set");
         b.mtp_emb = dalloc<float>((size_t) MAXT * N);
         b.mtp_src = dalloc<float>((size_t) MAXT * N);
-        b.mtp_cat = dalloc<float>((size_t) MAXT * 2 * N);
         b.mtp_R = dalloc<float>((size_t) MAXT * N);
         b.mtp_out = dalloc<float>((size_t) MAXT * N);
         b.mtp_logits = dalloc<float>((size_t) std::max(1, mc.dv1 - mc.dv0));
@@ -646,7 +646,7 @@ void Engine::mtp_enqueue(int T) {
         CardBuf& b = *cb_[c];
         const CardW& w = m_.cards[c];
         ck(cudaSetDevice(b.dev), "set");
-        k_norm_cat<<<T, 1024, 0, b.st>>>(b.mtp_emb, b.mtp_src, w.mtp_enorm, w.mtp_hnorm, b.mtp_cat, b.xtq, b.xtd, eps);
+        k_norm_cat<<<T, 1024, 0, b.st>>>(b.mtp_emb, b.mtp_src, w.mtp_enorm, w.mtp_hnorm, b.xtq, b.xtd, eps);
         ck(cudaGetLastError(), "norm_cat");
         mv(b, w.mtp_eh, b.xq, b.mtp_R, T);
         attn_half(b, w.mtp, b.mtp_R, false, S27_SLOTS - 1, Rows{b.mtp_ctl, LaneRows{}, nullptr}, w.q0, w.kv0, 0, T, eps, rope_of(b.mrope));
@@ -663,9 +663,7 @@ void Engine::mtp_enqueue(int T) {
         const MtpCard& mc = mtp_->cards[c];
         const int nv = mc.dv1 - mc.dv0;
         ck(cudaSetDevice(b.dev), "set");
-        add_norm(b, b.mtp_R, b.bo, w.mtp_head_norm, T, eps, false);
-        ck(cudaMemcpyAsync(b.mtp_out, b.mixed, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, b.st), "draft out");
-        quantize_q8_1(b.mtp_out + (size_t) (T - 1) * N, b.xq, N, 1, b.st);
+        add_norm(b, b.mtp_R, b.bo, w.mtp_head_norm, b.mtp_out, T, eps, true, true);
         mv(b, mc.head, b.xq, b.mtp_logits, 1);
         penalize_row(b.mtp_logits, nv, b.mtp_pen, b.mtp_pen_par, b.st);
         argmax(b.mtp_logits, nv, 1, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.err, b.st);

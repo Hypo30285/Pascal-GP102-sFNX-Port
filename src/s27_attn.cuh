@@ -192,10 +192,10 @@ static __global__ void __launch_bounds__(128, 3) k_s27_attn(const float* qkv, in
     }
 }
 
-// per (row, head): the splits merged, gated by sigmoid(gate), into att [T][NQ][HD]; with tq, also quantized into the
-// split twin (tq, td) of a q8_1 buffer of S27_NQ * HD-wide rows so wo's q8s_gemv needs no separate quantize_q8_1 launch
-static __global__ void __launch_bounds__(HD) k_s27_merge(const float* qkv, int row_stride, const float* part, float* att,
-                                                         int8_t* tq = nullptr, float* td = nullptr) {
+// per (row, head): the splits merged, gated by sigmoid(gate), and quantized directly into the split twin (tq, td)
+// of a q8_1 buffer of S27_NQ * HD-wide rows so wo's q8s_gemv needs no intermediate fp32 buffer or quantize_q8_1 launch
+static __global__ void __launch_bounds__(HD) k_s27_merge(const float* qkv, int row_stride, const float* part,
+                                                         int8_t* tq, float* td) {
     const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const float* ps = part + ((size_t) t * S27_NQ + h) * S27_ASPLIT * (HD + 2);
     float M = -INFINITY;
@@ -211,16 +211,13 @@ static __global__ void __launch_bounds__(HD) k_s27_merge(const float* qkv, int r
     const float g = qkv[(size_t) t * row_stride + h * 2 * HD + HD + d];
     const float v = a / L / (1.f + __expf(-g));
     const size_t idx = ((size_t) t * S27_NQ + h) * HD + d;
-    att[idx] = v;
-    if (tq) {
-        float amax = fabsf(v);
+    float amax = fabsf(v);
 #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-        const float sc = amax / 127.0f;
-        tq[idx] = amax == 0.0f ? 0 : (int8_t) roundf(v / sc);
-        if ((d & 31) == 0)
-            td[(size_t) t * (S27_NQ * HD / 32) + h * (HD / 32) + (d >> 5)] = __half2float(__float2half(sc));
-    }
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float sc = amax / 127.0f;
+    tq[idx] = amax == 0.0f ? 0 : (int8_t) roundf(v / sc);
+    if ((d & 31) == 0)
+        td[(size_t) t * (S27_NQ * HD / 32) + h * (HD / 32) + (d >> 5)] = __half2float(__float2half(sc));
 }
 
 }  // namespace fnx
