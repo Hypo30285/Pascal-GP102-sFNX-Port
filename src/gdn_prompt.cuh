@@ -400,6 +400,168 @@ __global__ void __launch_bounds__(GCH_THREADS) k_gdn_ch_rec(const float* __restr
     for (int e = tid; e < HS * GCB; e += GCH_THREADS) sst[(size_t) (e / GCB) * HS + c0 + e % GCB] = ss[e];
 }
 
+// ---------------------------------------------------------------- k_gdn_ch_rec on 48 KB (Z420 sm61-port)
+// The same sub-chunk recurrence for cards that give a block 48 KB of shared memory (Pascal sm_61): GCB61 = 16 state
+// columns a block (twice the blocks), 256 threads (a quarter of k_gdn_ch_rec's tile each, so its prefetch fits in
+// registers), T and P read through the read-only cache from the prep buffer
+// instead of shared memory, and U kept where Q was (Q is dead once Y is made). Every sum runs in k_gdn_ch_rec's order
+// (the key dimension in the same two halves, T R and P U row by row, the state update over i in order), so its outputs
+// are k_gdn_ch_rec's: FNX_PF_GDN_CHECK=1 holds both to the row-by-row kernel.
+constexpr int GCB61 = 16, GCH61_THREADS = 256, GCH61_BLOCKS_PER_HEAD = HS / GCB61;
+constexpr int GCH61_SMALL = 3 * GCH + 1;   // G, decay to end, b, G_last
+constexpr size_t GCH61_REC_SMEM = sizeof(float) * (2 * GCH * (HS + 1) + HS * GCB61 + 3 * GCH * GCB61 + GCH61_SMALL);
+static_assert(GCH61_REC_SMEM <= 48 * 1024, "k_gdn_ch_rec61 must fit sm_61's 48 KB a block");
+static_assert(GCH61_THREADS == GCH * (GCB61 / 4) * 2 && GCH61_THREADS == HS / 2 * (GCB61 / 4), "k_gdn_ch_rec61's thread tiles");
+static_assert(GCH * GCB61 <= GCH * (HS + 1), "U fits where Q was");
+constexpr int GCH61_KQ_PER = GCH * HS / GCH61_THREADS, GCH61_V_PER = GCH * GCB61 / GCH61_THREADS;
+static_assert(GCH * HS % GCH61_THREADS == 0 && GCH * GCB61 % GCH61_THREADS == 0 && GCH61_SMALL <= GCH61_THREADS, "even shares");
+
+__global__ void __launch_bounds__(GCH61_THREADS) k_gdn_ch_rec61(const float* __restrict__ xc, const float* __restrict__ prep,
+                                                               float* __restrict__ S, float* __restrict__ y32, int nk, int nv,
+                                                               const int* __restrict__ vmap, int C) {
+    const int lv = blockIdx.x / GCH61_BLOCKS_PER_HEAD, c0 = (blockIdx.x % GCH61_BLOCKS_PER_HEAD) * GCB61;
+    const int kh = vmap[lv] & 255, tid = threadIdx.x, ch = (2 * nk + nv) * HS;
+    extern __shared__ float gsm61[];
+    float(*ks)[HS + 1] = reinterpret_cast<float(*)[HS + 1]>(gsm61);
+    float(*qs)[HS + 1] = reinterpret_cast<float(*)[HS + 1]>(gsm61 + GCH * (HS + 1));
+    float* uu = gsm61 + GCH * (HS + 1);       // [GCH][GCB61], over qs once Y is made
+    float* ss = gsm61 + 2 * GCH * (HS + 1);   // [HS][GCB61]: the state's columns c0..
+    float* vv = ss + HS * GCB61;              // [GCH][GCB61] each: v; R; Y
+    float* rr = vv + GCH * GCB61;
+    float* yy = rr + GCH * GCB61;
+    float* sm = yy + GCH * GCB61;             // G, decay to end, b, G_last
+    float* sst = S + (size_t) lv * HS * HS;
+    for (int e = tid; e < HS * GCB61; e += GCH61_THREADS) ss[e] = sst[(size_t) (e / GCB61) * HS + c0 + e % GCB61];
+    const float scale = rsqrtf((float) HS);
+    const int nsub = (C + GCH - 1) / GCH;
+    float kq[2][GCH61_KQ_PER], vr[GCH61_V_PER], pr = 0.f;
+    auto fetch = [&](int sc) {
+        const int t0 = sc * GCH, n = min(GCH, C - t0);
+#pragma unroll
+        for (int j = 0; j < GCH61_KQ_PER; ++j) {
+            const int e = tid + j * GCH61_THREADS, i = e / HS, r = e % HS;
+            const float* row = xc + (size_t) (t0 + i) * ch;
+            kq[0][j] = i < n ? row[kh * HS + r] : 0.f;
+            kq[1][j] = i < n ? row[nk * HS + kh * HS + r] : 0.f;
+        }
+#pragma unroll
+        for (int j = 0; j < GCH61_V_PER; ++j) {
+            const int e = tid + j * GCH61_THREADS, i = e / GCB61, c = e % GCB61;
+            vr[j] = i < n ? xc[(size_t) (t0 + i) * ch + 2 * nk * HS + lv * HS + c0 + c] : 0.f;
+        }
+        const float* pg = prep + ((size_t) sc * nv + lv) * GCH_PREP_FLOATS;
+        pr = tid < GCH61_SMALL ? pg[2 * GCH * GCH + tid] : 0.f;
+    };
+    fetch(0);
+    for (int sc = 0; sc < nsub; ++sc) {
+        const int t0 = sc * GCH, n = min(GCH, C - t0);
+        __syncthreads();   // the last sub-chunk's reads are done
+#pragma unroll
+        for (int j = 0; j < GCH61_KQ_PER; ++j) {
+            const int e = tid + j * GCH61_THREADS;
+            qs[e / HS][e % HS] = kq[0][j];
+            ks[e / HS][e % HS] = kq[1][j];
+        }
+#pragma unroll
+        for (int j = 0; j < GCH61_V_PER; ++j) vv[tid + j * GCH61_THREADS] = vr[j];
+        if (tid < GCH61_SMALL) sm[tid] = pr;
+        __syncthreads();
+        if (sc + 1 < nsub) fetch(sc + 1);   // in flight while this one computes
+        const float* pg = prep + ((size_t) sc * nv + lv) * GCH_PREP_FLOATS;
+        const float* __restrict__ T = pg;             // global, read-only cache
+        const float* __restrict__ P = pg + GCH * GCH;
+        const float* G = sm;
+        const float* dec = G + GCH;
+        const float* B = dec + GCH;
+        const float glast = B[GCH];
+        // W = K S, Y = Q S: each thread 1 row x 4 columns of both over half of the key dimension
+        {
+            constexpr int RA = 1;
+            const int half = tid >> 7, t7 = tid & 127, i0 = t7 >> 2, cc = (t7 & 3) * 4;
+            float w[RA][4] = {}, y[RA][4] = {};
+#pragma unroll 4
+            for (int r = half * (HS / 2); r < (half + 1) * (HS / 2); ++r) {
+                const float4 s4 = *reinterpret_cast<const float4*>(ss + r * GCB61 + cc);
+                const float sv[4] = {s4.x, s4.y, s4.z, s4.w};
+#pragma unroll
+                for (int a = 0; a < RA; ++a) {
+                    const float k = ks[i0 + a][r], q = qs[i0 + a][r];
+#pragma unroll
+                    for (int b = 0; b < 4; ++b) w[a][b] = fmaf(k, sv[b], w[a][b]), y[a][b] = fmaf(q, sv[b], y[a][b]);
+                }
+            }
+            if (half) {
+#pragma unroll
+                for (int a = 0; a < RA; ++a)
+#pragma unroll
+                    for (int b = 0; b < 4; ++b) rr[(i0 + a) * GCB61 + cc + b] = w[a][b], yy[(i0 + a) * GCB61 + cc + b] = y[a][b];
+            }
+            __syncthreads();
+            if (!half) {
+#pragma unroll
+                for (int a = 0; a < RA; ++a)
+#pragma unroll
+                    for (int b = 0; b < 4; ++b) {
+                        const int e = (i0 + a) * GCB61 + cc + b;
+                        rr[e] = B[i0 + a] * (vv[e] - G[i0 + a] * (w[a][b] + rr[e]));
+                        yy[e] = y[a][b] + yy[e];
+                    }
+            }
+        }
+        __syncthreads();   // Q is dead from here: U takes its place
+        // U = T R (T lower-triangular): each thread column tid % GCB61, rows tid / GCB61 + 16 h
+        {
+            const int c = tid % GCB61;
+#pragma unroll
+            for (int h = 0; h < GCH * GCB61 / GCH61_THREADS; ++h) {
+                const int i = tid / GCB61 + h * (GCH61_THREADS / GCB61);
+                float u = 0.f;
+                for (int m = 0; m <= i; ++m) u = fmaf(__ldg(T + i * GCH + m), rr[m * GCB61 + c], u);
+                uu[i * GCB61 + c] = u;
+            }
+        }
+        __syncthreads();
+        // o = scale (G Y + P U)
+        {
+            const int c = tid % GCB61;
+#pragma unroll
+            for (int h = 0; h < GCH * GCB61 / GCH61_THREADS; ++h) {
+                const int t = tid / GCB61 + h * (GCH61_THREADS / GCB61);
+                float o = G[t] * yy[t * GCB61 + c];
+                for (int i = 0; i <= t; ++i) o = fmaf(__ldg(P + t * GCH + i), uu[i * GCB61 + c], o);
+                if (t < n) y32[(size_t) (t0 + t) * nv * HS + lv * HS + c0 + c] = o * scale;
+            }
+        }
+        // S = G_last S + K^T (decay U): each thread 2 rows x 4 columns of the state
+        {
+            constexpr int SR = 2;
+            const int r0 = (tid >> 2) * SR, cc = (tid & 3) * 4;
+            float s[SR][4];
+#pragma unroll
+            for (int a = 0; a < SR; ++a) {
+                const float4 v = *reinterpret_cast<const float4*>(ss + (r0 + a) * GCB61 + cc);
+                s[a][0] = glast * v.x, s[a][1] = glast * v.y, s[a][2] = glast * v.z, s[a][3] = glast * v.w;
+            }
+#pragma unroll 4
+            for (int i = 0; i < GCH; ++i) {
+                const float4 u = *reinterpret_cast<const float4*>(uu + i * GCB61 + cc);
+                const float uv[4] = {u.x, u.y, u.z, u.w}, d = dec[i];
+#pragma unroll
+                for (int a = 0; a < SR; ++a) {
+                    const float kd = d * ks[i][r0 + a];
+#pragma unroll
+                    for (int b = 0; b < 4; ++b) s[a][b] = fmaf(kd, uv[b], s[a][b]);
+                }
+            }
+#pragma unroll
+            for (int a = 0; a < SR; ++a)
+                *reinterpret_cast<float4*>(ss + (r0 + a) * GCB61 + cc) = make_float4(s[a][0], s[a][1], s[a][2], s[a][3]);
+        }
+    }
+    __syncthreads();
+    for (int e = tid; e < HS * GCB61; e += GCH61_THREADS) sst[(size_t) (e / GCB61) * HS + c0 + e % GCB61] = ss[e];
+}
+
 // the gated RMS norm with the row's square sum made here (the sub-chunk path keeps no per-block sums)
 __global__ void __launch_bounds__(HS) k_gdn_pf_norm_own(const float* __restrict__ qkvz, const float* __restrict__ nw,
                                                         float* __restrict__ y32, int nk, int nv, float eps) {

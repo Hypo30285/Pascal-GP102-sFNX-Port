@@ -1829,7 +1829,7 @@ void gdn_prompt(const float* qkvz, const float* ab, float* hist, const float* co
         return !e || !std::strcmp(e, "1");
     }();
     // Z420 sm61-port: k_gdn_ch_rec takes GCH_REC_SMEM (~73 KB) of shared memory a block; a card that cannot give a
-    // block that much (Pascal sm_61: 48 KB) takes the row-by-row kernel (FNX_PF_GDN_CHUNK=0's path) instead
+    // block that much (Pascal sm_61: 48 KB) takes k_gdn_ch_rec61 (gdn_prompt.cuh: the same sums on 48 KB)
     static int fits[16] = {};   // 0 unknown, 1 fits, -1 does not
     int cur = 0;
     cudaGetDevice(&cur);
@@ -1839,13 +1839,13 @@ void gdn_prompt(const float* qkvz, const float* ab, float* hist, const float* co
         fits[cur] = (size_t) optin >= GCH_REC_SMEM ? 1 : -1;
         if (fits[cur] < 0)
             std::fprintf(stderr, "gdn_prompt: card %d gives a block %d bytes of shared memory, the sub-chunk kernel takes %zu: "
-                                 "the row-by-row recurrence instead\n", cur, optin, GCH_REC_SMEM);
+                                 "k_gdn_ch_rec61 (%zu) instead\n", cur, optin, GCH_REC_SMEM, GCH61_REC_SMEM);
     }
-    if (chunked && fits[cur] > 0) {
+    if (chunked) {
         static thread_local bool smem_set[16] = {};
         int dev = 0;
         cudaGetDevice(&dev);
-        if (!smem_set[dev]) {
+        if (!smem_set[dev] && fits[cur] > 0) {
             if (cudaFuncSetAttribute(k_gdn_ch_rec, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) GCH_REC_SMEM) != cudaSuccess)
                 ck_launch("gdn_prompt: shared memory");
             smem_set[dev] = true;
@@ -1868,7 +1868,10 @@ void gdn_prompt(const float* qkvz, const float* ab, float* hist, const float* co
             cudaFree(s0), cudaFree(yr);
         }
         k_gdn_ch_prep<<<dim3((C + GCH - 1) / GCH, nv), GCH_THREADS, 0, s>>>(xc, ab, dt, a, vmap, nk, nv, C, chw);
-        k_gdn_ch_rec<<<nv * GCH_REC_BLOCKS_PER_HEAD, GCH_THREADS, GCH_REC_SMEM, s>>>(xc, chw, S, y32, nk, nv, vmap, C);
+        if (fits[cur] > 0)
+            k_gdn_ch_rec<<<nv * GCH_REC_BLOCKS_PER_HEAD, GCH_THREADS, GCH_REC_SMEM, s>>>(xc, chw, S, y32, nk, nv, vmap, C);
+        else
+            k_gdn_ch_rec61<<<nv * GCH61_BLOCKS_PER_HEAD, GCH61_THREADS, GCH61_REC_SMEM, s>>>(xc, chw, S, y32, nk, nv, vmap, C);
         if (check) {
             std::vector<float> y(ny), sn(ns);
             cudaMemcpyAsync(y.data(), y32, ny * 4, cudaMemcpyDeviceToHost, s);

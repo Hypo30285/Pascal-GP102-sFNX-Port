@@ -169,11 +169,24 @@ void lock_in_ram(const Tensor& t) {
     for (int i = 0; i < LOCKERS; ++i)
         th.emplace_back([&, i] {
             const uintptr_t lo = std::min(e, a + (uintptr_t) i * part), hi = std::min(e, lo + part);
-            if (hi > lo && mlock((const void*) lo, hi - lo) != 0) err[(size_t) i] = errno;
+            if (hi > lo && mlock((const void*) lo, hi - lo) != 0) {
+                err[(size_t) i] = errno;
+                // Z420 sm61-port, FNX_MLOCK_SOFT=1: fault the range in instead (the page cache keeps it on a box with
+                // RAM to spare); the warning below says so
+                if (env_flag("FNX_MLOCK_SOFT")) {
+                    unsigned sink = 0;
+                    for (uintptr_t p = lo; p < hi; p += PG) sink += *(const volatile unsigned char*) p;
+                    (void) sink;
+                }
+            }
         });
     for (auto& x : th) x.join();
     for (int en : err)
-        if (en)
+        if (en && env_flag("FNX_MLOCK_SOFT")) {
+            std::fprintf(stderr, "fnx: mlock of %s (%zu MiB) failed: %s; FNX_MLOCK_SOFT=1: faulted in, not locked\n", t.name.c_str(),
+                         (size_t) (t.nbytes >> 20), std::strerror(en));
+            return;
+        } else if (en)
             throw std::runtime_error("fnx: mlock of " + t.name + " (" + std::to_string(t.nbytes >> 20) + " MiB) failed: " + std::strerror(en) +
                                      "; run with RLIMIT_MEMLOCK raised (systemd-run -p LimitMEMLOCK=infinity)");
 }
