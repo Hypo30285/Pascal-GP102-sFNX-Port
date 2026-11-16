@@ -266,10 +266,12 @@ Stager::Stager(const Gguf& g, std::vector<Group> groups, int consumers, int ahea
         const int pf = ::open(g.shard_path(s).c_str(), O_RDONLY);
         if (pf < 0) throw std::runtime_error("stager: cannot open " + g.shard_path(s) + ": " + std::strerror(errno));
         plain_fd_.push_back(pf);
-        // a file system without O_DIRECT (tmpfs) is read through the page cache: the same bytes, only slower
-        const int df = ::open(g.shard_path(s).c_str(), O_RDONLY | O_DIRECT);
-        if (df < 0 && errno != EINVAL) throw std::runtime_error("stager: cannot open " + g.shard_path(s) + ": " + std::strerror(errno));
-        no_direct |= df < 0;
+        // a file system without O_DIRECT (tmpfs) is read through the page cache: the same bytes, only slower;
+        // Z420 sm61-port: for FNX_27B (29 GB in 128 GB RAM, stored on 8 TB HDD), always read through the page cache so the
+        // file stays warm in RAM and never triggers 4-thread O_DIRECT head seeks on the mechanical HDD
+        const int df = FNX_27B ? -1 : ::open(g.shard_path(s).c_str(), O_RDONLY | O_DIRECT);
+        if (df < 0 && !FNX_27B && errno != EINVAL) throw std::runtime_error("stager: cannot open " + g.shard_path(s) + ": " + std::strerror(errno));
+        no_direct |= (df < 0 && !FNX_27B);
         direct_fd_.push_back(df);
     }
     if (no_direct) std::fprintf(stderr, "gguf: the model's file system refuses O_DIRECT: read through the page cache\n");
