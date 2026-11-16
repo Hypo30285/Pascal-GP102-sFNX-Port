@@ -412,7 +412,14 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     // ROUND_MS, a verify row DRAFT_ROW_MS more and a draft call after d1 DRAFT_CALL_MS (Q4, lab, 2026-10-25, prose with
     // K fixed at 1 / 2 / 3 / 4: 12.47 / 14.76 / 16.60 / 18.34 ms a round). FNX_DRAFT_ADAPT=0: always K
     const bool adapt = env_int("FNX_DRAFT_ADAPT", 1) != 0;
+#if FNX_27B && (!defined(FNX_ARCH) || FNX_ARCH == 61)
+    // Dual Quadro P6000 (GP102 sm_61, FNX_NCARD=2): T=1 verify 43.3 ms, T=5 verify 51.9 ms (~2.15 ms/row), MTP draft call ~1.35 ms
+    constexpr double ROUND_MS = 43.3, DRAFT_ROW_MS = 2.15, DRAFT_CALL_MS = 1.35, DECAY = 0.97;
+#elif FNX_27B
+    constexpr double ROUND_MS = 16.5, DRAFT_ROW_MS = 1.24, DRAFT_CALL_MS = 0.65, DECAY = 0.97;
+#else
     constexpr double ROUND_MS = 11.2, DRAFT_ROW_MS = 1.3, DRAFT_CALL_MS = 0.65, DECAY = 0.97;
+#endif
     std::vector<double> tried(MAXT, 1.0), stood(MAXT, 0.7);   // a prior of 70% at every position
     auto chain_len = [&]() {
         int best = K_;

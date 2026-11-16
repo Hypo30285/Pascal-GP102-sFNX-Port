@@ -23,7 +23,9 @@ namespace fnx {
 // The 27B's rows (make FNX_MODEL=27b; s27_run S27_BENCH=1, 2026-10-29): verify 16.1 ms at 1 row, 24.8 at 8 (~1.24 a row),
 // 42.8 at 16 (~2.25 a row past 8); its draft-layer calls and groups are Flash-Next's numbers, not measured on it
 struct RowCost {
-#if FNX_27B
+#if FNX_27B && (!defined(FNX_ARCH) || FNX_ARCH == 61)
+    double round_ms = 43.3, row_lo = 2.80, row_hi = 8.03, call_ms = 1.4, chain_ms = 1.35, group_ms = 0.8;
+#elif FNX_27B
     double round_ms = 16.5, row_lo = 1.24, row_hi = 2.25, call_ms = 0.7, chain_ms = 0.6, group_ms = 0.8;
 #else
     double round_ms = 10.8, row_lo = 1.5, row_hi = 1.8, call_ms = 0.7, chain_ms = 0.6, group_ms = 0.8;
