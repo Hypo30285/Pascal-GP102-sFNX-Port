@@ -1,4 +1,4 @@
-# sFNX (`sm61-port` — Dual GP102 Pascal P6000/P40 + Ivy Bridge)
+# Pascal GP102 sFNX Port (`sm61-port` — Dual Quadro P6000/P40 + Ivy Bridge)
 
 <p align="start"><img src="front/web/sphynx.svg" width="96" alt="sFNX"></p>
 
