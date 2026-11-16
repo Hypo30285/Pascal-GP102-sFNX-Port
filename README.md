@@ -1,6 +1,33 @@
-# sFNX
+# sFNX (`sm61-port` — Dual GP102 Pascal P6000/P40 + Ivy Bridge)
 
 <p align="start"><img src="front/web/sphynx.svg" width="96" alt="sFNX"></p>
+
+> **Upstream Credit:** This repository is a pure `sm_61` (NVIDIA Pascal GP102) and Intel Ivy Bridge (`Xeon E5-2697 v2`) hardware port of **[johnfink8/sfnx](https://github.com/johnfink8/sfnx)** (base commit [`9808733`](https://github.com/johnfink8/sfnx/commit/9808733)). Full credit for the `sFNX` tensor-parallel engine, custom PCIe BAR1 P2P ring (`k_ring3`), CUDA-graphed Gated DeltaNet + GQA hybrid architecture, NextN MTP speculative verification, and serving stack belongs to **[John Fink (`@johnfink8`)](https://github.com/johnfink8)**.
+
+### Pascal GP102 (`ARCH=61`, `FNX_MODEL=27b`, `FNX_NCARD=2`) on HP Z420 Workstation
+- **Hardware:** Dual NVIDIA Quadro P6000 24 GB GDDR5X (`GP102`, `sm_61`, `150 W` equalized power cap, `PCIe 3.0 x16` Slot 2 + Slot 5, `BAR1 P2P` ring) + Intel Xeon E5-2697 v2 (`12C/24T` Ivy Bridge `AVX + F16C`, `-mno-avx2 -mno-fma`, `128 GB` DDR3-1866 ECC RAM).
+- **Model:** `Qwen3.8-27B-Q8_0.gguf` (`29.05 GB`, `100%` `Q8_0` weights + `blk.64` NextN MTP head + `mmproj-F16.gguf` vision encoder, `65,536` context window across `4` lanes).
+- **What `sm61-port` Adds (`./z420_build.sh`):**
+  1. **`src/sm61_compat.cuh`:** `__nanosleep` (`clock64()` poll on `sm_61`) and `__match_any_sync` (ballot + `__ffs` leader loop) emulations so the entire `sFNX` codebase compiles cleanly for `ARCH=61` with `STACK:0 LOCAL:0` across every kernel.
+  2. **`k_gdn_ch_rec61` (`src/gdn_prompt.cuh`):** `48 KB` shared-memory (`256` threads, `REG:210 STACK:0`) prompt chunk recurrence for Pascal's `48 KB/block` shared-memory limit, preserving exact sequential `k` reduction order (`1.57e-7..1.04e-6` max relative error vs row-by-row reference across all 48 GDN layers).
+  3. **`k_pf_q8s_dp4a<BN, TC>` (`src/s27_prefill.cu`):** Native GP102 `__dp4a` INT8 tiled prefill GEMM (`BN ∈ {16, 32, 48, 64}`, `REG:53..64 STACK:0`, padded shared-memory tiles) directly over the split `Q8_0` weight layout, bypassing `sm_70` Tensor Core `f16` dequantization (`378 tok/s` prefill at `512` tokens, `361 tok/s` at `8,192` tokens).
+  4. **Decode & Speculative Verification Optimizations (`src/s27_attn.cuh`, `src/s27_engine.cu`, `src/dense.cuh`, `src/session.cpp`):**
+     - **6× GQA KV-Cache Sharing (`k_s27_attn`, `REG:96 STACK:0`):** Shares each KV head's paged `uint4` loads in shared memory across all 6 query heads per card (`6×` reduction in KV-cache global memory reads).
+     - **In-Place `q8_1` Split-Twin Quantization & Zero Dead Stores (`k_s27_merge`, `k_norm_cat`, `k_add_norm`):** Writes `(b.xtq, b.xtd)` directly in place, eliminating `k_quantize` launches, dead `FP32` global writes (`b.att`, `b.mtp_cat`), and redundant D2D `cudaMemcpyAsync` nodes.
+     - **4-Row Register Weight Sharing (`Q8S_R=4` for `T=3, 4` in `src/dense.cuh`):** Cuts `T=3` (`56.97` → `45.11 ms`) and `T=4` (`64.65` → `50.08 ms`) speculative verify windows by `21–22%`, reaching **`376.2 GB/s` per card (`93.8%` of raw GP102 DRAM read ceiling)** in `bin/s27_probe`.
+     - **Calibrated NextN MTP Cost Model (`ROUND_MS=43.3, DRAFT_ROW_MS=2.15, DRAFT_CALL_MS=1.35`):** Tuned `Session::generate`'s dynamic `chain_len` planner for the dense 27B's `32:1` trunk-to-draft ratio (`47.8 tok/s` at `temp=0.6`, **`50.4 tok/s`** at `temp=0.0` greedy, `32.3–34.7 tok/s` sustained out to `53,752` total context tokens).
+
+| Stage (`Qwen3.8-27B-Q8_0`, 512-tok generation on Dual Quadro P6000) | Decode (`tok/s`) | Decode Time (`512` tok) | Drafts Accepted / Offered | Verify Rounds |
+| :--- | :---: | :---: | :---: | :---: |
+| **1. Initial `sm_61` Port (`150W / 135W` asymmetric cap)** | `32.0 tok/s` | `15,998.0 ms` | `303 / 618` (`49.0%`) | `209` |
+| **2. Equalized `150W / 150W` Power Limit (`1430–1506 MHz` both GPUs)** | `40.2 tok/s` | `12,739.4 ms` | `303 / 618` (`49.0%`) | `209` |
+| **3. GQA KV-Sharing + Fused `q8_1` Twins + `T=3..4` `Q8S_R=4` (`commit 4a15054`)** | `44.6 tok/s` | `11,471.3 ms` | `303 / 618` (`49.0%`) | `209` |
+| **4. Calibrated MTP Cost Model (`ROUND_MS=43.3`, `temp=0.6`, `commit bf78ee5`)** | **`47.8 tok/s`** (`+49.4%`) | `10,704.5 ms` | `329 / 640` (`51.4%`) | `183` |
+| **5. Dead-Store / Graph Cleanup (`temp=0.0` greedy, `commit 5a06ec0`)** | **`50.4 tok/s`** (`+57.5%`) | `10,156.0 ms` | `334 / 722` (`46.3%`) | **`178`** |
+
+---
+
+## Original Upstream `sFNX` README (`johnfink8/sfnx`)
 
 **Qwen3.8-Flash-Next at 382 tokens a second on a code edit, for $1,800 of used GPUs.**
 
