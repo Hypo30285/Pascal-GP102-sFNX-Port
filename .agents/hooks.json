@@ -1,0 +1,31 @@
+{
+  "z420-sfnx-cache-and-guardrails": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "/bin/bash /home/tom/projects/ai_scripts/grab_context.sh --mode=session",
+        "timeout": 5
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "/bin/bash /home/tom/projects/ai_scripts/grab_context.sh --mode=turn",
+        "timeout": 3
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /home/tom/.gemini/config/hooks/z420_pretool_gate.py",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,61 @@
+{
+ "exe": "bin/sfnx",
+ "args": [
+  "--native",
+  "/mnt/storage_8tb_linux/models/gguf/Qwen3.8-Flash-Next-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+  "--mtp",
+  "/mnt/storage_8tb_linux/failsafe_runtime/PolyStrata-data/mtp/rt",
+  "--draft-vocab",
+  "data/draft_vocab_en.bin",
+  "--max-context",
+  "32768",
+  "--spec",
+  "6",
+  "--lookup",
+  "15",
+  "--conversation-cache-mib",
+  "16384",
+  "--batch",
+  "1"
+ ],
+ "cwd": ".",
+ "env": {
+  "FNX_ENGRAM_GGUF": "/mnt/samsung_storage/ple/Qwen3.8-Flash-Next-UD-Q6_K_XL-00003-of-00006.gguf",
+  "FNX_HYBRID_Q6_GGUF": "/mnt/storage_8tb_linux/models/gguf/qwen3.8-flash-next-ud-q6_k_xl/qwen3.8-flash-next-ud-q6_k_xl/Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00006.gguf",
+  "FNX_HYBRID_MAP": "q4q6q8",
+  "FNX_MTP_DIR": "/mnt/storage_8tb_linux/failsafe_runtime/PolyStrata-data/mtp/rt",
+  "FNX_MTP_EXPERTS": "q2_0",
+  "FNX_NGRAM": "disk",
+  "FNX_NGRAM_CACHE_MIB": "1024",
+  "FNX_NGRAM_THREADS": "16",
+  "FNX_CPU_EXPERTS": "1",
+  "FNX_CPU_THREADS": "12",
+  "FNX_EXPERT_PROFILE": "/mnt/storage_8tb_linux/failsafe_runtime/PolyStrata-data/profiles/qwen38-flash-next-z420.profile",
+  "FNX_GPU1_RESERVE_MIB": "2048",
+  "FNX_SKIP_BAR1_CHECK": "1",
+  "FNX_LMHEAD_6P2": "1",
+  "FNX_KV8": "1",
+  "FNX_PF_DP4A": "1",
+  "FNX_PF_MOE_Q8": "0",
+  "FNX_MLOCK_SOFT": "1"
+ },
+ "tokenizer": "data/tokenizer",
+ "model_name": "qwen3.8-flash-next-ud-q4_k_xl-q6q8-sfnx-sm61",
+ "log": "serve/sfnx-fnx-z420.log",
+ "lib_dirs": [
+  "/mnt/samsung_storage/toolchains/cuda128/bin",
+  "/mnt/samsung_storage/toolchains/cuda128/lib",
+  "/mnt/samsung_storage/toolchains/cuda128/targets/x86_64-linux/lib"
+ ],
+ "port": 8096,
+ "gpu": [
+  0,
+  1
+ ],
+ "sampling": {
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "presence_penalty": 1.0
+ },
+ "reasoning_close_retry": true
+}

@@ -210,7 +210,85 @@ __global__ void __launch_bounds__(256) k_idx_score_tc(const float* __restrict__ 
         __syncwarp();
     }
 #else
-    __trap();   // sm_61: no tensor cores; the 27B never launches this (src/sm61_compat.cuh)
+    // Pascal sm_61 FP32-FMA tiled QSA scorer (zero WMMA, zero FP16 arithmetic, ~17 KB SMEM):
+    // 16 query rows (64 head vectors) x 64 pooled keys, tiled in DK=32 slices into bank-conflict-free SMEM;
+    // each thread holds all QSA_HEADS=4 accumulators for 4 keys so ReLU + head sum stay in registers.
+    static_assert(QSA_HEADS == 4 && QSC_ROWS == 16 && QSC_KEYS == 64 && QSA_DIM == 128, "sm_61 k_idx_score_tc geometry");
+    const int t0 = blockIdx.y * QSC_ROWS, j0 = blockIdx.x * QSC_KEYS, tid = threadIdx.x;
+    const int tl = min(T, t0 + QSC_ROWS) - 1;
+    const int nv_max = (*pos0p + tl + 1) / QSA_POOL;
+    if (nv_max <= QSA_TOP || j0 >= nv_max) return;
+    constexpr int DK = 32, Q_LD = 65, K_LD = 65;
+    __shared__ float qs[DK][Q_LD];
+    __shared__ float ks[DK][K_LD];
+    __shared__ size_t k_off[QSC_KEYS];
+    if (tid < QSC_KEYS) {
+        const int j = j0 + tid;
+        k_off[tid] = j < nv_max ? kvp_block(g, j) : 0;
+    }
+    __syncthreads();
+    const int lv = tid >> 2, ld8 = tid & 3;
+    const int q_t = t0 + (lv >> 2), k_j = j0 + lv;
+    const int r = tid >> 4, cg = tid & 15;
+    float acc[QSA_HEADS][4] = {};
+    for (int d0 = 0; d0 < QSA_DIM; d0 += DK) {
+        if (q_t < T) {
+            const float* qp = q + (size_t) (t0 * QSA_HEADS + lv) * QSA_DIM + d0 + ld8 * 8;
+            const float4 q0 = __ldg(reinterpret_cast<const float4*>(qp));
+            const float4 q1 = __ldg(reinterpret_cast<const float4*>(qp + 4));
+            qs[ld8 * 8 + 0][lv] = q0.x;
+            qs[ld8 * 8 + 1][lv] = q0.y;
+            qs[ld8 * 8 + 2][lv] = q0.z;
+            qs[ld8 * 8 + 3][lv] = q0.w;
+            qs[ld8 * 8 + 4][lv] = q1.x;
+            qs[ld8 * 8 + 5][lv] = q1.y;
+            qs[ld8 * 8 + 6][lv] = q1.z;
+            qs[ld8 * 8 + 7][lv] = q1.w;
+        } else {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) qs[ld8 * 8 + k][lv] = 0.f;
+        }
+        if (k_j < nv_max) {
+            const uint4 kv4 = __ldg(reinterpret_cast<const uint4*>(pooled + k_off[lv] + d0 + ld8 * 8));
+            const uint32_t hw[4] = {kv4.x, kv4.y, kv4.z, kv4.w};
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                ks[ld8 * 8 + w * 2 + 0][lv] = __half2float(__ushort_as_half((uint16_t) (hw[w] & 0xFFFFu)));
+                ks[ld8 * 8 + w * 2 + 1][lv] = __half2float(__ushort_as_half((uint16_t) (hw[w] >> 16)));
+            }
+        } else {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) ks[ld8 * 8 + k][lv] = 0.f;
+        }
+        __syncthreads();
+#pragma unroll 8
+        for (int k = 0; k < DK; ++k) {
+            float qv[QSA_HEADS], kv[4];
+#pragma unroll
+            for (int h = 0; h < QSA_HEADS; ++h) qv[h] = qs[k][r * QSA_HEADS + h];
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) kv[jj] = ks[k][cg + jj * 16];
+#pragma unroll
+            for (int h = 0; h < QSA_HEADS; ++h)
+#pragma unroll
+                for (int jj = 0; jj < 4; ++jj) acc[h][jj] = fmaf(qv[h], kv[jj], acc[h][jj]);
+        }
+        __syncthreads();
+    }
+    const float w = rsqrtf((float) QSA_DIM);
+    const int t = t0 + r;
+    if (t < T) {
+#pragma unroll
+        for (int jj = 0; jj < 4; ++jj) {
+            const int j = j0 + cg + jj * 16;
+            if (j < nv_max && j < max_pools) {
+                float s = 0.f;
+#pragma unroll
+                for (int h = 0; h < QSA_HEADS; ++h) s += fmaxf(acc[h][jj], 0.f) * w;
+                scores[(size_t) t * max_pools + j] = s;
+            }
+        }
+    }
 #endif
 }
 

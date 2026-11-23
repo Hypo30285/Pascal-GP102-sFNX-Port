@@ -9,10 +9,13 @@
 // activations are fetched into registers while the tensor cores run the current one. On random experts of the real
 // shapes (tools/moe_mma_bench, 4,096 tokens) this takes gate|up 3.4 ms and down 2.2 ms per layer and card, against
 // 4.8 and 4.0 ms for 8 warps of 16-row tiles at 128 columns.
+#if FNX_ARCH >= 70
 #include <mma.h>
+#endif
 
 namespace {
 
+#if FNX_ARCH >= 70
 // a k-step of MM_KC columns; a K-quant row takes MM_TPR threads (16 quant bytes, 32 weights each), so one pass of the
 // block's threads fills MM_PASS rows; tile rows are padded to MM_LD halves (8: the fewest bank conflicts)
 constexpr int MM_BM = 64, MM_KC = 64, MM_TPR = MM_KC / 32, MM_THREADS = 128, MM_PASS = MM_THREADS / MM_TPR, MM_LD = MM_KC + 8;
@@ -214,6 +217,59 @@ template <> struct MmTile<GGML_TYPE_Q8_0> {
         mm_store8(sw + r * MM_LD + u * 32 + 16, y + 8);
     }
 };
+template <> struct MmTile<GGML_TYPE_Q6_K> {
+    uint16_t ql[16], qh[16], dh;
+    int8_t sc0, sc1;
+    bool live, item;
+    __device__ __forceinline__ void fetch(const char* we, size_t row_a, int nrows, int row0, int k0, int kc) {
+        const int r = threadIdx.x / MM_TPR, u = threadIdx.x % MM_TPR, row = row0 + r;
+        item = u * 32 < kc;
+        live = item && row < nrows;
+        if (live) {
+            const int b32 = k0 / 32 + u, kb = b32 >> 3, sb = b32 & 7, h128 = sb >> 2, q32 = sb & 3;
+            const uint8_t* blk = (const uint8_t*) we + (size_t) row * row_a + (size_t) kb * 210;
+            const uint16_t* qlp = reinterpret_cast<const uint16_t*>(blk + h128 * 64 + (q32 & 1) * 32);
+            const uint16_t* qhp = reinterpret_cast<const uint16_t*>(blk + 128 + h128 * 32);
+#pragma unroll
+            for (int l = 0; l < 16; ++l) {
+                ql[l] = qlp[l];
+                qh[l] = qhp[l];
+            }
+            const int8_t* sc = reinterpret_cast<const int8_t*>(blk + 192);
+            sc0 = sc[2 * sb];
+            sc1 = sc[2 * sb + 1];
+            dh = *reinterpret_cast<const uint16_t*>(blk + 208);
+        }
+    }
+    __device__ __forceinline__ void put(int k0, int, __half* sw) const {
+        if (!item) return;
+        const int r = threadIdx.x / MM_TPR, u = threadIdx.x % MM_TPR;
+        __half2 y[16];
+        if (live) {
+            const int sb = (k0 / 32 + u) & 7, q32 = sb & 3;
+            const int ql_shift = (q32 >> 1) * 4, qh_shift = q32 * 2;
+            const float d = __half2float(__ushort_as_half(dh));
+            const __half2 d0 = __float2half2_rn(d * (float) sc0), d1 = __float2half2_rn(d * (float) sc1);
+            const __half2 k = __half2half2(__ushort_as_half(0x6420));   // 1024 + 32 = 1056
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                const uint32_t qlw = (uint32_t) ql[2 * w] | ((uint32_t) ql[2 * w + 1] << 16);
+                const uint32_t qhw = (uint32_t) qh[2 * w] | ((uint32_t) qh[2 * w + 1] << 16);
+                const uint32_t a = ((qlw >> ql_shift) & 0x0F0F0F0Fu) | (((qhw >> qh_shift) & 0x03030303u) << 4);
+                const __half2 ds = w < 4 ? d0 : d1;
+                __half2 x0, x1;
+                mm_bytes_h2(a, k, x0, x1);
+                y[2 * w] = __hmul2(x0, ds);
+                y[2 * w + 1] = __hmul2(x1, ds);
+            }
+        } else {
+#pragma unroll
+            for (int l = 0; l < 16; ++l) y[l] = __float2half2_rn(0.f);
+        }
+        mm_store8(sw + r * MM_LD + u * 32, y);
+        mm_store8(sw + r * MM_LD + u * 32 + 16, y + 8);
+    }
+};
 
 // the job's activation rows for one k-step: rows past n (up to the token tiles' 16 * nt) are zeros. A thread's rows and
 // columns are the same at every step (element e = threadIdx.x + i * MM_THREADS is row e / MM_V8, 8 columns e % MM_V8)
@@ -252,8 +308,6 @@ __device__ __forceinline__ void mma_884(float (&d)[8], unsigned a0, unsigned a1,
                  "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
                  : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
-#else
-    __trap();   // sm_61: no tensor cores; the 27B never launches this (src/sm61_compat.cuh)
 #endif
 }
 
@@ -381,10 +435,331 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
         }
         out[(size_t) jb.out[j] * w.nrows + row] = v;
     }
-#else
-    __trap();   // sm_61: no tensor cores; the 27B never launches this (src/sm61_compat.cuh)
 #endif
 }
+#else
+// Pascal sm_61 (GP102) INT8 __dp4a tiled MoE kernel (47 TOPS/card, zero FP16 arithmetic, zero HMMA, <= 6 KB SMEM).
+// Processes a BigJob (up to PF_JOB=64 tokens) x DP_BM=64 weight rows in 32-column steps: on-the-fly f16 -> q8_1
+// activation quantization in SMEM, bank-conflict-free weight unpacking for Q4_K / Q5_K / Q6_K / Q5_1 / Q8_0, and
+// 4x4 register-tiled __dp4a inner products with 16-lane coalesced output stores.
+constexpr int DP_BM = 64, DP_BN = PF_JOB, DP_THREADS = 256, DP_SW_LD = DP_BM + 1, DP_SX_LD = DP_BN + 1;
+static_assert(DP_BM == 64 && DP_BN == 64 && DP_THREADS == 256, "k_pf_moe_dp4a tile layout");
+
+__device__ __forceinline__ float dp_wsum(float v) {
+#pragma unroll
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+__device__ __forceinline__ float dp_wmax(float v) {
+#pragma unroll
+    for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+__device__ __forceinline__ void dp_scale_min_k4(int j, const uint4& hd, int& d, int& m) {
+    if (j < 4) {
+        d = (hd.y >> (8 * j)) & 63;
+        m = (hd.z >> (8 * j)) & 63;
+    } else {
+        const int s = 8 * (j - 4);
+        d = ((hd.w >> s) & 0xF) | (((hd.y >> (s + 6)) & 3) << 4);
+        m = ((hd.w >> (s + 4)) & 0xF) | (((hd.z >> (s + 6)) & 3) << 4);
+    }
+}
+__device__ __forceinline__ uint32_t dp_spread4(uint32_t t) {
+    return ((t & 1u) << 4) | ((t & 2u) << 11) | ((t & 4u) << 18) | ((t & 8u) << 25);
+}
+__device__ __forceinline__ int dp_q6_sign(uint32_t u) {
+    const uint32_t nm = (~u & 0x20202020u);
+    return (int) ((u & 0x1F1F1F1Fu) | nm | (nm << 1) | (nm << 2));
+}
+
+// Warp-cooperative 128 B coalesced global/UVA load of nbytes (even, <= 272) strictly within [src, src + nbytes).
+template <bool ALWAYS_AL4>
+__device__ __forceinline__ void dp_load_row_coop(uint8_t* dst, const uint8_t* src, int nbytes, int lane) {
+    if (ALWAYS_AL4 || (((uintptr_t) src & 3u) == 0u)) {
+        const int n32 = nbytes >> 2;
+        const uint32_t* s32 = reinterpret_cast<const uint32_t*>(src);
+        uint32_t* d32 = reinterpret_cast<uint32_t*>(dst);
+        for (int i = lane; i < n32; i += 32) d32[i] = __ldg(s32 + i);
+        if (!ALWAYS_AL4 && (nbytes & 2) && lane == 0) {
+            *reinterpret_cast<uint16_t*>(dst + nbytes - 2) = __ldg(reinterpret_cast<const uint16_t*>(src + nbytes - 2));
+        }
+    } else {
+        if (lane == 0) *reinterpret_cast<uint16_t*>(dst) = __ldg(reinterpret_cast<const uint16_t*>(src));
+        const int rem = nbytes - 2;
+        const int n32 = rem >> 2;
+        const uint32_t* s32 = reinterpret_cast<const uint32_t*>(src + 2);
+        uint16_t* d16 = reinterpret_cast<uint16_t*>(dst + 2);
+        for (int i = lane; i < n32; i += 32) {
+            const uint32_t v = __ldg(s32 + i);
+            d16[i * 2 + 0] = (uint16_t) (v & 0xFFFFu);
+            d16[i * 2 + 1] = (uint16_t) (v >> 16);
+        }
+        if ((rem & 2) && lane == 0) {
+            *reinterpret_cast<uint16_t*>(dst + nbytes - 2) = __ldg(reinterpret_cast<const uint16_t*>(src + nbytes - 2));
+        }
+    }
+    __syncwarp();
+}
+
+template <bool HAS_MIN>
+__device__ __forceinline__ void dp_quant_x(const BigJob& jb, const __half* __restrict__ x, int ldx, int b, int n,
+                                           int warp, int lane, int (&sx)[8][DP_SX_LD], float* sxd, float* sxs) {
+    for (int t = warp; t < n; t += 8) {
+        const float v = __half2float(__ldg(x + (size_t) jb.y[t] * ldx + b * 32 + lane));
+        const float amax = dp_wmax(fabsf(v));
+        const float scale = amax / 127.0f;
+        const float iscale = amax > 0.0f ? 127.0f / amax : 0.0f;
+        const uint32_t b0 = (uint8_t) (int8_t) __float2int_rn(v * iscale);
+        const uint32_t b1 = __shfl_down_sync(0xffffffffu, b0, 1);
+        const uint32_t b2 = __shfl_down_sync(0xffffffffu, b0, 2);
+        const uint32_t b3 = __shfl_down_sync(0xffffffffu, b0, 3);
+        if ((lane & 3) == 0) sx[lane >> 2][t] = (int) (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+        if constexpr (HAS_MIN) {
+            const float xsum = dp_wsum(v);
+            if (lane == 0) {
+                sxd[t] = scale;
+                sxs[t] = xsum;
+            }
+        } else {
+            if (lane == 0) sxd[t] = scale;
+        }
+    }
+}
+
+template <bool HAS_MIN>
+__device__ __forceinline__ void dp_mma_32(const int (&sw8)[8][8][DP_SW_LD], int sb, const float* sdw, const float* smw,
+                                          const int (&sx)[8][DP_SX_LD], const float* sxd, const float* sxs,
+                                          int r_lane, int tc, int n, float (&acc)[4][4]) {
+    if (tc >= n) return;
+    int dp[4][4] = {};
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        int wv[4], xv[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) wv[i] = sw8[sb][k][r_lane + i * 16];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) xv[j] = sx[k][tc + j];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) dp[i][j] = __dp4a(wv[i], xv[j], dp[i][j]);
+    }
+    float dw[4], dx[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) dw[i] = sdw[r_lane + i * 16];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) dx[j] = sxd[tc + j];
+    if constexpr (HAS_MIN) {
+        float mw[4], xs[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) mw[i] = smw[r_lane + i * 16];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) xs[j] = sxs[tc + j];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                acc[i][j] = fmaf(mw[i], xs[j], fmaf((float) dp[i][j], dw[i] * dx[j], acc[i][j]));
+    } else {
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                acc[i][j] = fmaf((float) dp[i][j], dw[i] * dx[j], acc[i][j]);
+    }
+}
+
+__device__ __forceinline__ void dp_mma_q6k_32(const int (&sw8)[8][8][DP_SW_LD], int sb,
+                                              const float (&sdw16)[16][DP_BM], int s_base,
+                                              const int (&sx)[8][DP_SX_LD], const float* sxd,
+                                              int r_lane, int tc, int n, float (&acc)[4][4]) {
+    if (tc >= n) return;
+#pragma unroll 1
+    for (int half = 0; half < 2; ++half) {
+        const int k0 = half * 4;
+#pragma unroll
+        for (int ig = 0; ig < 2; ++ig) {
+            const int i0 = ig * 2;
+            int dp[2][4] = {};
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                int xv[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) xv[j] = sx[k0 + k][tc + j];
+#pragma unroll
+                for (int ii = 0; ii < 2; ++ii) {
+                    const int wi = sw8[sb][k0 + k][r_lane + (i0 + ii) * 16];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) dp[ii][j] = __dp4a(wi, xv[j], dp[ii][j]);
+                }
+            }
+            float dx[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) dx[j] = sxd[tc + j];
+#pragma unroll
+            for (int ii = 0; ii < 2; ++ii) {
+                const float dwi = sdw16[s_base + half][r_lane + (i0 + ii) * 16];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i0 + ii][j] = fmaf((float) dp[ii][j], dwi * dx[j], acc[i0 + ii][j]);
+            }
+        }
+    }
+}
+
+template <int TYPE>
+__global__ void __launch_bounds__(DP_THREADS, 4) k_pf_moe_dp4a(MoeW w, const BigJob* __restrict__ jobs,
+                                                               const int* __restrict__ njobs, const __half* __restrict__ x,
+                                                               int ldx, float* __restrict__ out) {
+    constexpr bool HAS_MIN = (TYPE == GGML_TYPE_Q4_K || TYPE == GGML_TYPE_Q5_K || TYPE == GGML_TYPE_Q5_1);
+    constexpr int SDW_SLOTS = (TYPE == GGML_TYPE_Q6_K) ? 16 : 8;
+    const int ji = blockIdx.y;
+    if (ji >= *njobs) return;
+    __shared__ BigJob jb;
+    // Union aliases per-warp raw PCIe/UVA load buffer (272 B/warp = 2,176 B) with sx[8][65] (2,080 B) across phases.
+    __shared__ union {
+        int sx[8][DP_SX_LD];
+        uint32_t raw32[8][68];
+        uint16_t raw16[8][136];
+        uint8_t raw8[8][272];
+    } sm_x;
+    __shared__ int sw8[8][8][DP_SW_LD];
+    __shared__ float sdw[SDW_SLOTS][DP_BM];
+    __shared__ float smw[HAS_MIN ? 8 : 1][HAS_MIN ? DP_BM : 1];
+    __shared__ float sxd[DP_BN];
+    __shared__ float sxs[HAS_MIN ? DP_BN : 1];
+    load_bigjob(jb, jobs + ji);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int n = jb.n, row0 = blockIdx.x * DP_BM, nb = w.ncols >> 5;
+    if (tid < DP_BN) {
+        sxd[tid] = 0.f;
+        if constexpr (HAS_MIN) sxs[tid] = 0.f;
+    }
+    const char* we = moe_expert(w, jb.w);
+    const int r_lane = tid & 15, c_grp = tid >> 4, tc = c_grp * 4;
+    float acc[4][4] = {};
+
+    // Unified 256-weight tile loop (8 x 32-weight sub-blocks):
+    // Exact 1.0x global/UVA reads via warp-cooperative 128 B contiguous row loads (8 rows/warp, <= 23.9 KB SMEM -> 4 CTAs/SM).
+    for (int k8 = 0; k8 < nb; k8 += 8) {
+        const int chunk = (nb - k8 < 8) ? (nb - k8) : 8;
+        uint8_t* raw8 = sm_x.raw8[warp];
+        uint16_t* raw16 = sm_x.raw16[warp];
+        uint32_t* raw32 = sm_x.raw32[warp];
+#pragma unroll 1
+        for (int rr = 0; rr < 8; ++rr) {
+            const int r = warp * 8 + rr;
+            const int gr = row0 + r;
+            if (gr >= w.nrows) {
+                if (lane < SDW_SLOTS) sdw[lane][r] = 0.f;
+                if constexpr (HAS_MIN) {
+                    if (lane < 8) smw[lane][r] = 0.f;
+                }
+                sw8[lane >> 3][lane & 7][r] = 0;
+                sw8[4 + (lane >> 3)][lane & 7][r] = 0;
+                continue;
+            }
+            const uint8_t* row_p = reinterpret_cast<const uint8_t*>(we) + (size_t) gr * w.row_a;
+            if constexpr (TYPE == GGML_TYPE_Q4_K) {
+                dp_load_row_coop<true>(raw8, row_p + (size_t) (k8 >> 3) * 144, 144, lane);
+                if (lane < 8) {
+                    const uint4 hd = make_uint4(raw32[0], raw32[1], raw32[2], raw32[3]);
+                    const float d = __half2float(__ushort_as_half((uint16_t) (hd.x & 0xFFFFu)));
+                    const float dmin = __half2float(__ushort_as_half((uint16_t) (hd.x >> 16)));
+                    int sc, m;
+                    dp_scale_min_k4(lane, hd, sc, m);
+                    sdw[lane][r] = d * (float) sc;
+                    smw[lane][r] = -(dmin * (float) m);
+                }
+                const uint32_t q = raw32[4 + lane];
+                const int jg = lane >> 3, kw = lane & 7;
+                sw8[jg * 2 + 0][kw][r] = (int) (q & 0x0F0F0F0Fu);
+                sw8[jg * 2 + 1][kw][r] = (int) ((q >> 4) & 0x0F0F0F0Fu);
+            } else if constexpr (TYPE == GGML_TYPE_Q5_K) {
+                dp_load_row_coop<true>(raw8, row_p + (size_t) (k8 >> 3) * 176, 176, lane);
+                if (lane < 8) {
+                    const uint4 hd = make_uint4(raw32[0], raw32[1], raw32[2], raw32[3]);
+                    const float d = __half2float(__ushort_as_half((uint16_t) (hd.x & 0xFFFFu)));
+                    const float dmin = __half2float(__ushort_as_half((uint16_t) (hd.x >> 16)));
+                    int sc, m;
+                    dp_scale_min_k4(lane, hd, sc, m);
+                    sdw[lane][r] = d * (float) sc;
+                    smw[lane][r] = -(dmin * (float) m);
+                }
+                const uint32_t q = raw32[12 + lane];
+                const int jg = lane >> 3, kw = lane & 7;
+                const uint32_t h = raw32[4 + kw];
+                const int sb0 = jg * 2, sb1 = sb0 + 1;
+                sw8[sb0][kw][r] = (int) ((q & 0x0F0F0F0Fu) | (((h >> sb0) & 0x01010101u) << 4));
+                sw8[sb1][kw][r] = (int) (((q >> 4) & 0x0F0F0F0Fu) | (((h >> sb1) & 0x01010101u) << 4));
+            } else if constexpr (TYPE == GGML_TYPE_Q6_K) {
+                dp_load_row_coop<false>(raw8, row_p + (size_t) (k8 >> 3) * 210, 210, lane);
+                if (lane < 16) {
+                    const float d = __half2float(__ushort_as_half(raw16[104]));
+                    sdw[lane][r] = d * (float) (int8_t) raw8[192 + lane];
+                }
+                const int h128 = lane >> 4, pair = (lane >> 3) & 1, kw = lane & 7;
+                const uint32_t ql = raw32[lane];
+                const uint32_t qh = raw32[32 + h128 * 8 + kw];
+                const int sh_lo = pair * 2, sh_hi = 4 + pair * 2;
+                sw8[h128 * 4 + pair][kw][r] = dp_q6_sign((ql & 0x0F0F0F0Fu) | (((qh >> sh_lo) & 0x03030303u) << 4));
+                sw8[h128 * 4 + 2 + pair][kw][r] = dp_q6_sign(((ql >> 4) & 0x0F0F0F0Fu) | (((qh >> sh_hi) & 0x03030303u) << 4));
+            } else if constexpr (TYPE == GGML_TYPE_Q8_0) {
+                dp_load_row_coop<false>(raw8, row_p + (size_t) k8 * 34, chunk * 34, lane);
+                if (lane < chunk) sdw[lane][r] = __half2float(__ushort_as_half(raw16[lane * 17]));
+#pragma unroll
+                for (int s2 = 0; s2 < 2; ++s2) {
+                    const int sb = s2 * 4 + (lane >> 3);
+                    if (sb < chunk) {
+                        const int kw = lane & 7, h0 = sb * 17 + 1 + kw * 2;
+                        sw8[sb][kw][r] = (int) ((uint32_t) raw16[h0] | ((uint32_t) raw16[h0 + 1] << 16));
+                    }
+                }
+            } else if constexpr (TYPE == GGML_TYPE_Q5_1) {
+                dp_load_row_coop<true>(raw8, row_p + (size_t) k8 * 24, chunk * 24, lane);
+                if (lane < chunk) {
+                    const uint32_t dm = raw32[lane * 6];
+                    sdw[lane][r] = __half2float(__ushort_as_half((uint16_t) (dm & 0xFFFFu)));
+                    smw[lane][r] = __half2float(__ushort_as_half((uint16_t) (dm >> 16)));
+                }
+                const int sb = lane >> 2, kw4 = lane & 3;
+                if (sb < chunk) {
+                    const uint32_t qh = raw32[sb * 6 + 1];
+                    const uint32_t q = raw32[sb * 6 + 2 + kw4];
+                    sw8[sb][kw4][r] = (int) ((q & 0x0F0F0F0Fu) | dp_spread4(qh >> (kw4 * 4)));
+                    sw8[sb][4 + kw4][r] = (int) (((q >> 4) & 0x0F0F0F0Fu) | dp_spread4(qh >> (16 + kw4 * 4)));
+                }
+            }
+        }
+        __syncthreads();  // all warps done reading sm_x.raw before dp_quant_x writes sm_x.sx
+
+#pragma unroll 1
+        for (int sb = 0; sb < chunk; ++sb) {
+            dp_quant_x<HAS_MIN>(jb, x, ldx, k8 + sb, n, warp, lane, sm_x.sx, sxd, sxs);
+            __syncthreads();
+            if constexpr (TYPE == GGML_TYPE_Q6_K) {
+                dp_mma_q6k_32(sw8, sb, sdw, sb * 2, sm_x.sx, sxd, r_lane, tc, n, acc);
+            } else {
+                dp_mma_32<HAS_MIN>(sw8, sb, sdw[sb], smw[HAS_MIN ? sb : 0], sm_x.sx, sxd, sxs, r_lane, tc, n, acc);
+            }
+            __syncthreads();
+        }
+    }
+
+    if (tc < n) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int tj = tc + j;
+            if (tj < n) {
+                const size_t base = (size_t) jb.out[tj] * w.nrows + row0 + r_lane;
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    if (row0 + r_lane + i * 16 < w.nrows) out[base + i * 16] = acc[i][j];
+            }
+        }
+    }
+}
+#endif
 
 // h = silu(gate) * up of the stacked gate|up rows, rounded to f16 (llama.cpp's swiglu output, converted for cuBLAS)
 __global__ void k_swiglu_h16(const float* __restrict__ gu, int ffs, int P, __half* __restrict__ h) {

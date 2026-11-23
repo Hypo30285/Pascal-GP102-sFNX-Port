@@ -67,12 +67,70 @@ std::string write(const std::string& dir, const std::string& tag, const std::vec
     return path;
 }
 
+struct TensorSpec {
+    std::string name;
+    uint32_t type;
+    std::vector<uint64_t> ne;
+    uint8_t fill;
+};
+
+std::vector<uint8_t> make_multi(const std::vector<TensorSpec>& specs, const Kv& kv = {}) {
+    std::vector<uint8_t> b;
+    auto put = [&](const void* p, size_t n) { b.insert(b.end(), (const uint8_t*) p, (const uint8_t*) p + n); };
+    auto u32 = [&](uint32_t v) { put(&v, 4); };
+    auto u64 = [&](uint64_t v) { put(&v, 8); };
+    u32(0x46554747u);
+    u32(3);
+    u64(specs.size());
+    u64(kv.n);
+    put(kv.b.data(), kv.b.size());
+    std::vector<uint64_t> sizes(specs.size());
+    std::vector<uint64_t> offs(specs.size());
+    uint64_t cur = 0;
+    for (size_t i = 0; i < specs.size(); ++i) {
+        const fnx::TypeInfo ti = fnx::type_info(specs[i].type);
+        uint64_t nel = 1;
+        for (uint64_t d : specs[i].ne) nel *= d;
+        sizes[i] = (nel / ti.block) * ti.bytes;
+        cur = (cur + 31ull) & ~31ull;
+        offs[i] = cur;
+        cur += sizes[i];
+    }
+    for (size_t i = 0; i < specs.size(); ++i) {
+        u64(specs[i].name.size());
+        put(specs[i].name.data(), specs[i].name.size());
+        u32((uint32_t) specs[i].ne.size());
+        for (uint64_t d : specs[i].ne) u64(d);
+        u32(specs[i].type);
+        u64(offs[i]);
+    }
+    while (b.size() % 32) b.push_back(0);
+    const size_t data0 = b.size();
+    b.resize(data0 + (size_t) cur, 0);
+    for (size_t i = 0; i < specs.size(); ++i)
+        std::memset(b.data() + data0 + offs[i], specs[i].fill, (size_t) sizes[i]);
+    return b;
+}
+
+std::string write_exact(const std::string& path, const std::vector<uint8_t>& b) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f || std::fwrite(b.data(), 1, b.size(), f) != b.size() || std::fclose(f) != 0)
+        throw std::runtime_error("cannot write " + path);
+    return path;
+}
+
+bool all_bytes(const uint8_t* p, size_t n, uint8_t v) {
+    for (size_t i = 0; i < n; ++i)
+        if (p[i] != v) return false;
+    return true;
+}
+
 int failures = 0;
 
 void expect_refused(const std::string& dir, const std::string& tag, const std::vector<uint8_t>& b, const char* want) {
     const std::string path = write(dir, tag, b);
     try {
-        fnx::Gguf g(path);
+        fnx::Gguf g(path, false);
         std::printf("FAIL %s: loaded\n", tag.c_str());
         ++failures;
     } catch (const std::runtime_error& e) {
@@ -91,7 +149,7 @@ int main(int argc, char** argv) {
     {
         const std::string path = write(dir, "valid", make(2, {8, 3}, 8 * 3 * 4));
         try {
-            fnx::Gguf g(path);
+            fnx::Gguf g(path, false);
             const fnx::Tensor& t = g.t("w");
             const bool ok = t.n_dims == 2 && t.ne[0] == 8 && t.ne[1] == 3 && t.ne[2] == 1 && t.ne[3] == 1 &&
                             t.nbytes == 96 && t.row_bytes() == 32;
@@ -112,7 +170,7 @@ int main(int argc, char** argv) {
         kv.u32("a.rope.scaling.original_context_length", 32768);
         const std::string path = write(dir, "keys", make(2, {8, 3}, 8 * 3 * 4, 0, kv));
         try {
-            fnx::Gguf g(path);
+            fnx::Gguf g(path, false);
             const bool ok = g.has_key("a.rope.scaling.type") && g.s("a.rope.scaling.type") == "yarn" && g.num("a.rope.scaling.factor") == 4.0 &&
                             g.num("a.rope.scaling.original_context_length") == 32768.0 && g.i("a.rope.scaling.original_context_length") == 32768 &&
                             !g.has_key("a.rope.scaling.alpha");
@@ -159,7 +217,7 @@ int main(int argc, char** argv) {
             std::string got;
             bool ok;
             try {
-                fnx::Gguf g(path);
+                fnx::Gguf g(path, false);
                 const fnx::ModelRope r = fnx::model_rope(g, "a.");
                 got = "x" + std::to_string(r.yarn_factor) + " from " + std::to_string(r.yarn_orig);
                 ok = !c.refused && r.yarn_factor == c.factor && r.yarn_orig == c.orig;
@@ -184,6 +242,154 @@ int main(int argc, char** argv) {
     expect_refused(dir, "bytes_overflow", make(1, {1ull << 62}, 64), "runs past the end");
     expect_refused(dir, "past_end", make(2, {8, 3}, 95), "runs past the end");
     expect_refused(dir, "offset_wraps", make(1, {8}, 64, ~0ull - 8), "runs past the end");
+
+    {   // FNX_ENGRAM_GGUF: missing final split shard skipped when external engram supplies per_layer_token_embd.weight
+        const std::string base1 = dir + "/fnx_engram_base-00001-of-00002.gguf";
+        const std::string base_miss = dir + "/fnx_engram_mid-00001-of-00003.gguf";
+        const std::string base_full = dir + "/fnx_engram_full.gguf";
+        const std::string ext_ok = dir + "/fnx_engram_ext_ok.gguf";
+        const std::string ext_bad_name = dir + "/fnx_engram_ext_noname.gguf";
+        const std::string ext_bad_shape = dir + "/fnx_engram_ext_shape.gguf";
+        write_exact(base1, make_multi({{"token_embd.weight", fnx::T_Q8_0, {32, 4}, 0x21}}));
+        write_exact(base_miss, make_multi({{"token_embd.weight", fnx::T_Q8_0, {32, 4}, 0x21}}));
+        write_exact(base_full, make_multi({{"token_embd.weight", fnx::T_Q8_0, {32, 4}, 0x21},
+                                           {"per_layer_token_embd.weight", fnx::T_IQ4_NL, {160, 4}, 0x11}}));
+        write_exact(ext_ok, make_multi({{"per_layer_token_embd.weight", fnx::T_Q8_0, {160, 4}, 0x5a}}));
+        write_exact(ext_bad_name, make_multi({{"other.weight", fnx::T_Q8_0, {160, 4}, 0x5a}}));
+        write_exact(ext_bad_shape, make_multi({{"per_layer_token_embd.weight", fnx::T_Q8_0, {160, 8}, 0x5a}}));
+
+        // 1. Missing final shard without engram must fail
+        {
+            bool ok = false;
+            try { fnx::Gguf g(base1, false); } catch (const std::runtime_error& e) { ok = std::strstr(e.what(), "cannot open") != nullptr; }
+            std::printf("%s engram_missing_tail_no_env: refused missing shard\n", ok ? "ok  " : "FAIL");
+            failures += !ok;
+        }
+        // 2. Missing final shard WITH engram_gguf succeeds and supplies exact tensor & shard path
+        {
+            fnx::GgufOpts opts;
+            opts.engram_gguf = ext_ok;
+            bool ok = false;
+            try {
+                fnx::Gguf g(base1, opts);
+                const fnx::Tensor& pt = g.t("per_layer_token_embd.weight");
+                ok = g.has_engram_override() && pt.type == fnx::T_Q8_0 && pt.ne[0] == 160 && pt.ne[1] == 4 &&
+                     g.shard_path(pt.shard) == ext_ok && all_bytes(pt.data, pt.nbytes, 0x5a);
+            } catch (const std::runtime_error& e) { std::printf("  err: %s\n", e.what()); }
+            std::printf("%s engram_missing_tail_override: loaded missing-tail model with external PLE\n", ok ? "ok  " : "FAIL");
+            failures += !ok;
+        }
+        // 3. Missing non-final shard (00002-of-00003) still refused even with engram_gguf
+        {
+            fnx::GgufOpts opts;
+            opts.engram_gguf = ext_ok;
+            bool ok = false;
+            try { fnx::Gguf g(base_miss, opts); } catch (const std::runtime_error& e) { ok = std::strstr(e.what(), "cannot open") != nullptr; }
+            std::printf("%s engram_missing_nonfinal: refused missing middle shard\n", ok ? "ok  " : "FAIL");
+            failures += !ok;
+        }
+        // 4. Engram shard missing per_layer_token_embd.weight refused
+        {
+            fnx::GgufOpts opts;
+            opts.engram_gguf = ext_bad_name;
+            bool ok = false;
+            try { fnx::Gguf g(base1, opts); } catch (const std::runtime_error& e) { ok = std::strstr(e.what(), "per_layer_token_embd.weight") != nullptr; }
+            std::printf("%s engram_missing_tensor: refused shard without PLE tensor\n", ok ? "ok  " : "FAIL");
+            failures += !ok;
+        }
+        // 5. Override existing PLE tensor (Q8_0 replacing IQ4_NL, matching shape)
+        {
+            fnx::GgufOpts opts;
+            opts.engram_gguf = ext_ok;
+            bool ok = false;
+            try {
+                fnx::Gguf g(base_full, opts);
+                const fnx::Tensor& pt = g.t("per_layer_token_embd.weight");
+                ok = g.has_engram_override() && pt.type == fnx::T_Q8_0 && g.shard_path(pt.shard) == ext_ok &&
+                     all_bytes(pt.data, pt.nbytes, 0x5a);
+            } catch (const std::runtime_error& e) { std::printf("  err: %s\n", e.what()); }
+            std::printf("%s engram_replace_existing: Q8_0 override replaced IQ4_NL\n", ok ? "ok  " : "FAIL");
+            failures += !ok;
+        }
+        // 6. Shape mismatch refused
+        {
+            fnx::GgufOpts opts;
+            opts.engram_gguf = ext_bad_shape;
+            bool ok = false;
+            try { fnx::Gguf g(base_full, opts); } catch (const std::runtime_error& e) { ok = std::strstr(e.what(), "does not match base") != nullptr; }
+            std::printf("%s engram_shape_mismatch: refused mismatched PLE shape\n", ok ? "ok  " : "FAIL");
+            failures += !ok;
+        }
+        for (const std::string& p : {base1, base_miss, base_full, ext_ok, ext_bad_name, ext_bad_shape}) std::remove(p.c_str());
+    }
+
+    {   // FNX_HYBRID_Q6_GGUF + FNX_HYBRID_MAP=q4q6q8: cross-shard splicing & multi-shard Stager verification
+        const std::string bpath = dir + "/fnx_hyb_base.gguf";
+        const std::string q6_1 = dir + "/fnx_hyb_q6-00001-of-00002.gguf";
+        const std::string q6_2 = dir + "/fnx_hyb_q6-00002-of-00002.gguf";
+        std::vector<TensorSpec> base_specs, q6_s1, q6_s2;
+        for (int l = 0; l < 4; ++l) {
+            const std::string p = "blk." + std::to_string(l) + ".";
+            const uint32_t bgu = (l == 2) ? fnx::T_Q5_K : fnx::T_Q4_K;
+            const uint32_t bdn = (l == 2) ? fnx::T_Q8_0 : fnx::T_Q5_1;
+            base_specs.push_back({p + "ffn_gate_exps.weight", bgu, {256, 32, 2}, (uint8_t) (0x10 + l)});
+            base_specs.push_back({p + "ffn_up_exps.weight", bgu, {256, 32, 2}, (uint8_t) (0x20 + l)});
+            base_specs.push_back({p + "ffn_down_exps.weight", bdn, {32, 256, 2}, (uint8_t) (0x30 + l)});
+            auto& dst = (l < 2) ? q6_s1 : q6_s2;
+            const uint32_t sgu = (l == 2) ? fnx::T_Q8_0 : fnx::T_Q6_K;
+            dst.push_back({p + "ffn_gate_exps.weight", sgu, {256, 32, 2}, (uint8_t) (0x60 + l)});
+            dst.push_back({p + "ffn_up_exps.weight", sgu, {256, 32, 2}, (uint8_t) (0x70 + l)});
+            dst.push_back({p + "ffn_down_exps.weight", fnx::T_Q8_0, {32, 256, 2}, (uint8_t) (0x80 + l)});
+        }
+        write_exact(bpath, make_multi(base_specs));
+        write_exact(q6_1, make_multi(q6_s1));
+        write_exact(q6_2, make_multi(q6_s2));
+
+        {
+            fnx::GgufOpts opts;
+            opts.hybrid_q6_gguf = q6_1;
+            bool ok = false;
+            try {
+                fnx::Gguf g(bpath, opts);
+                auto chk = [&](const std::string& name, uint32_t tp, uint8_t fill) {
+                    const fnx::Tensor& t = g.t(name);
+                    return t.type == tp && all_bytes(t.data, t.nbytes, fill);
+                };
+                ok = g.has_hybrid_splice() && g.hybrid_map() == "q4q6q8" &&
+                     chk("blk.0.ffn_gate_exps.weight", fnx::T_Q6_K, 0x60) &&
+                     chk("blk.0.ffn_up_exps.weight", fnx::T_Q6_K, 0x70) &&
+                     chk("blk.0.ffn_down_exps.weight", fnx::T_Q8_0, 0x80) &&
+                     chk("blk.1.ffn_gate_exps.weight", fnx::T_Q6_K, 0x61) &&
+                     chk("blk.1.ffn_down_exps.weight", fnx::T_Q8_0, 0x81) &&
+                     chk("blk.2.ffn_gate_exps.weight", fnx::T_Q8_0, 0x62) &&
+                     chk("blk.2.ffn_up_exps.weight", fnx::T_Q8_0, 0x72) &&
+                     chk("blk.2.ffn_down_exps.weight", fnx::T_Q8_0, 0x82) &&
+                     // Interior layer L03: gate/up remain base Q4_K, down spliced to Q8_0
+                     chk("blk.3.ffn_gate_exps.weight", fnx::T_Q4_K, 0x13) &&
+                     chk("blk.3.ffn_up_exps.weight", fnx::T_Q4_K, 0x23) &&
+                     chk("blk.3.ffn_down_exps.weight", fnx::T_Q8_0, 0x83);
+                // Verify Stager reads cross-shard L03 group (base Q4 gate/up + Q6 shard2 down) byte-identically
+                fnx::Stager st(g, {fnx::Stager::Group{{"blk.3.ffn_gate_exps.weight", "blk.3.ffn_down_exps.weight"}, false}}, 1, 1);
+                const fnx::Tensor& sg = st.t(0, "blk.3.ffn_gate_exps.weight");
+                const fnx::Tensor& sd = st.t(0, "blk.3.ffn_down_exps.weight");
+                ok = ok && all_bytes(sg.data, sg.nbytes, 0x13) && all_bytes(sd.data, sd.nbytes, 0x83);
+                st.done(0);
+            } catch (const std::runtime_error& e) { std::printf("  err: %s\n", e.what()); }
+            std::printf("%s hybrid_q4q6q8_splice_and_stager: L00/L01=Q6+Q8, L02=Q8+Q8, L03=Q4+Q8 + Stager verified\n",
+                        ok ? "ok  " : "FAIL");
+            failures += !ok;
+        }
+        {
+            fnx::GgufOpts opts;
+            opts.hybrid_q6_gguf = q6_1;
+            opts.hybrid_map = "bogus";
+            bool ok = false;
+            try { fnx::Gguf g(bpath, opts); } catch (const std::runtime_error& e) { ok = std::strstr(e.what(), "unsupported FNX_HYBRID_MAP") != nullptr; }
+            std::printf("%s hybrid_bad_map: refused bogus map\n", ok ? "ok  " : "FAIL");
+            failures += !ok;
+        }
+        for (const std::string& p : {bpath, q6_1, q6_2}) std::remove(p.c_str());
+    }
 
     for (int a = 2; a < argc; ++a) {
         try {

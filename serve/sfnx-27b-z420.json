@@ -1,5 +1,5 @@
 {
- "exe": "bin/sfnx",
+ "exe": "bin/sfnx-27b",
  "args": [
   "--native",
   "/mnt/storage_8tb_linux/models/gguf/Qwen3.8-27B-Q8_0/Qwen3.8-27B-Q8_0.gguf",
@@ -29,8 +29,9 @@
  "model_name": "qwen3.8-27b-q8_0-sfnx-sm61",
  "log": "serve/sfnx-27b-z420.log",
  "lib_dirs": [
-  "/mnt/nvme_storage/ai_projects/polystrata/.toolchain/bin",
-  "/mnt/nvme_storage/ai_projects/polystrata/.toolchain/lib64"
+  "/mnt/samsung_storage/toolchains/cuda128/bin",
+  "/mnt/samsung_storage/toolchains/cuda128/lib",
+  "/mnt/samsung_storage/toolchains/cuda128/targets/x86_64-linux/lib"
  ],
  "port": 8097,
  "gpu": [

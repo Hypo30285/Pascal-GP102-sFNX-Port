@@ -24,6 +24,7 @@ struct Refused : std::runtime_error {
 
 struct CardBuf;
 struct CardPool;
+class CpuExpertPool;
 
 // FNX_BATCH_DRAFTS: what a batched window carries besides each lane's next token: nothing (0: one row a lane,
 // Engine::step), the lanes' n-gram lookup drafts (lookup), or those and the draft layer's chain, the draft layer then
@@ -115,6 +116,8 @@ public:
     std::vector<unsigned long long> probe_counts() const;
     // with FNX_ROUTE_TRACE=M: decode's picks in order, layer << 16 | expert (a window's layers run 0 .. NL - 1)
     std::vector<unsigned> route_trace(size_t from = 0) const;   // the picks from index `from` on
+    // concise CPU cold-expert bridge stats (no-op when cpu_experts is off or on 27b)
+    void log_cpu_pool_stats(const char* tag = nullptr) const;
     void use_lane(int i);
     int lane() const { return cur_; }
     int lanes() const { return (int) lanes_.size(); }
@@ -289,8 +292,9 @@ private:
     void embed_token(int tok, int cell, float* out) const;   // one token's embedding (N); an image cell's row
     std::vector<int> graph_key(const std::vector<int>& lanes) const;   // a window graph's: the lanes, their tables, cache_live()
     // the expert cache can miss: experts in RAM, or an arena lending (with nothing lent every expert is in a slot and
-    // the windows skip the plan and copy)
+    // the windows skip the plan and copy); static FNX_CPU_EXPERTS=1 mode never uses ExpertCache CLOCK swaps
     bool cache_live() const {
+        if (m_.cpu_experts) return false;
         const ExpertCache& ec = m_.cards[0].ec;
         return ec.n_slots && (!arena_cap_ || !ec.arena_full || arena_w_ > arena_base_);
     }
@@ -334,7 +338,10 @@ private:
     void dense(const DW& W, const void* y, float* out, CardBuf& b, int T);
     void attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
                    uint16_t* qsa_ring, uint16_t* qsa_pooled, int call);
-    void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl);
+    void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl, int lyr = -1);
+#if !FNX_27B
+    std::unique_ptr<CpuExpertPool> cpu_pool_;
+#endif
 #if FNX_27B
     // the 27B's window (s27_engine.cu): the layers and head over T rows, one sequence's or a batched window's (lanes),
     // with the recurrent core each kind runs

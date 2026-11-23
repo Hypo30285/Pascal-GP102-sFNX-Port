@@ -55,12 +55,16 @@ struct CardBuf {
     void* xq = nullptr;     // q8_1 rows of up to S27_XQ_COLS, with a split twin (q8_twin) add_norm writes directly
     int8_t* xtq = nullptr;
     float* xtd = nullptr;
+    void* head_xq = nullptr;
+    int8_t* head_xtq = nullptr;
+    float* head_xtd = nullptr;
     void* hq = nullptr;     // the FFN's swiglu as q8_1 rows of the card's FF slice, with its twin
     float *qkvz = nullptr, *ab = nullptr, *gdn_scratch = nullptr;
     float* qkv = nullptr;   // [T][S27_QKV]: the card's q | gate heads, K heads, V heads
     float* apart = nullptr;
     float* gu = nullptr;
     float* head_logits = nullptr;
+    VHeadWork vh_work{};
     int *tk_pen_tok = nullptr, *tk_pen_cnt = nullptr, *tk_pen_n = nullptr, *tk_i = nullptr;   // top_tokens()
     float* tk_v = nullptr;
     unsigned* tk_err = nullptr;
@@ -105,6 +109,9 @@ struct CardBuf {
     // the draft layer: its token rows, source rows, residual, outputs after the head norm, head logits
     float *mtp_emb = nullptr, *mtp_src = nullptr, *mtp_R = nullptr, *mtp_out = nullptr,
           *mtp_logits = nullptr, *mtp_bv = nullptr;
+    void* mtp_xq = nullptr;
+    int8_t* mtp_xtq = nullptr;
+    float* mtp_xtd = nullptr;
     int *mtp_bi = nullptr, *mtp_ctl = nullptr;
     int* mtp_pen = nullptr;           // the last row's penalties (penalize_row's pen, this card's draft-vocabulary indexes)
     float* mtp_pen_par = nullptr;

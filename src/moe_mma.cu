@@ -4,7 +4,9 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#if FNX_ARCH >= 70
 #include <mma.h>
+#endif
 
 #include "sm61_compat.cuh"   // Z420 sm61-port: Pascal shims (nanosleep, match_any, FNX_TC)
 
@@ -29,9 +31,13 @@ __device__ __forceinline__ float silu_(float x) { return x / (1.0f + __expf(-x))
 
 template <int TYPE>
 void mma_launch(const MoeW& w, const BigJob* jobs, const int* njobs, int njobs_cap, const __half* x, float* out, cudaStream_t s) {
+#if FNX_ARCH < 70
+    k_pf_moe_dp4a<TYPE><<<dim3((w.nrows + DP_BM - 1) / DP_BM, njobs_cap), DP_THREADS, 0, s>>>(w, jobs, njobs, x, w.ncols, out);
+#else
     constexpr size_t sm = mm_smem<MM_BM>();
     static_assert(sm <= 48 * 1024, "moe_mma: shared memory past the default limit");
     k_moe_mma<TYPE, MM_BM><<<dim3((w.nrows + MM_BM - 1) / MM_BM, njobs_cap), MM_THREADS, sm, s>>>(w, jobs, njobs, x, w.ncols, out);
+#endif
 }
 
 void moe_mma(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int njobs_cap, const __half* x, float* out, void* st) {
@@ -41,6 +47,7 @@ void moe_mma(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int n
     switch (A.type) {
         case T_Q4_K: mma_launch<GGML_TYPE_Q4_K>(w, jobs, njobs, njobs_cap, x, out, s); break;
         case T_Q5_K: mma_launch<GGML_TYPE_Q5_K>(w, jobs, njobs, njobs_cap, x, out, s); break;
+        case T_Q6_K: mma_launch<GGML_TYPE_Q6_K>(w, jobs, njobs, njobs_cap, x, out, s); break;
         case T_Q5_1: mma_launch<GGML_TYPE_Q5_1>(w, jobs, njobs, njobs_cap, x, out, s); break;
         case T_Q8_0: mma_launch<GGML_TYPE_Q8_0>(w, jobs, njobs, njobs_cap, x, out, s); break;
         default: throw std::runtime_error("moe_mma: expert type " + std::to_string(A.type) + " not handled");

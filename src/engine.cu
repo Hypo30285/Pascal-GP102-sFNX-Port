@@ -55,8 +55,7 @@ __global__ void ngram_wait_copy_k(const volatile unsigned* flag, const int* ctl,
         for (;;) {
             // acquire at system scope: the rows the host wrote before its release store are visible to this thread,
             // and the __syncthreads below carries that to the block's other threads
-            unsigned f;
-            asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(f) : "l"(flag) : "memory");
+            const unsigned f = fnx_ld_acquire_sys_u32(flag);
             if (f == want) {
                 ok = 1;
                 break;
@@ -115,7 +114,8 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             std::fprintf(stderr, "fnx: note: context %d is within the trained %d: the scaling changes every position's rotary "
                          "and no length needs it\n", max_ctx, m_.ctx_train);
     }
-    const long long pf_rows = env_int("FNX_PF_ROWS", pf_c_);
+    const long long pf_rows_def = (FNX_ARCH < 70 && NCARD == 2) ? 1024 : pf_c_;
+    const long long pf_rows = env_int("FNX_PF_ROWS", pf_rows_def);
     if (pf_rows < MAXT || pf_rows > 8192 || pf_rows % MAXT)
         throw std::runtime_error("FNX_PF_ROWS: a multiple of " + std::to_string(MAXT) + " from " + std::to_string(MAXT) + " to 8192, got " +
                                  std::to_string(pf_rows));
@@ -198,6 +198,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         if (w.ec.n_slots) b->cache_list = dalloc<int>(1 + P);
         b->gu = dalloc<float>((size_t) (P + MAXT) * 2 * ffs);
         b->part = dalloc<float>((size_t) (P + MAXT) * N);
+        b->cold_out = (c == 0 && m.cpu_experts) ? dalloc<float>((size_t) MAXT * N) : nullptr;
         b->sh_gu = dalloc<float>((size_t) MAXT * 2 * ffs);
         b->sh_hq = dalloc<uint8_t>((size_t) MAXT * q8_1_bytes(ffs));
         if (!std::getenv("FNX_NO_TWIN")) {
@@ -210,6 +211,15 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->ple_key = dalloc<float>((size_t) 3 * MAXT * D);   // key, then room for gated and normalized rows
         b->ple_val = dalloc<float>((size_t) MAXT * N);
         b->head_logits = dalloc<float>((size_t) MAXT * (w.v1 - w.v0));
+        if (w.out_6p2.hi) {
+            b->head_xq = dalloc<uint8_t>((size_t) MAXT * q8_1_bytes(N));
+            if (!std::getenv("FNX_NO_TWIN")) {
+                q8_twin(b->head_xq, (size_t) MAXT * q8_1_bytes(N), dalloc<int8_t>((size_t) MAXT * N),
+                        dalloc<float>((size_t) MAXT * N / 32));
+                own([q = (const void*) b->head_xq] { q8_untwin(q); });
+            }
+            init_vhead_work(b->vh_work, w.v1 - w.v0, N, b->head_logits);
+        }
         b->best_v = dalloc<float>(MAXT);
         b->best_i = dalloc<int>(MAXT);
         b->am_keys = dalloc<unsigned long long>(MAXT);
@@ -294,10 +304,20 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     // comes later: the window graphs captured at first use (with batched drafts a verify graph per row total), cuBLAS's
     // workspaces and the lanes' page tables. Default 512: they took ~270 MiB a card on three cards and ~340 on two,
     // through one to six lanes, batched drafts and a 114k prompt
+    // Per-card VRAM reserve: FNX_ARENA_RESERVE_MIB on GPU 0 (graphs, cuBLAS, page tables), and on display GPU 1
+    // enforce >= std::max(reserve_mib, FNX_GPU1_RESERVE_MIB) (default 2048 MiB on Dual-P6000 sm_61) so display GPU 1
+    // always retains >= 2,048 MiB free after graphs / KV / prefill / MTP.
+    const long long reserve_mib = env_int("FNX_ARENA_RESERVE_MIB", 512);
+    if (reserve_mib < 0) throw std::runtime_error("FNX_ARENA_RESERVE_MIB: want MiB >= 0, got " + std::to_string(reserve_mib));
+    const long long gpu1_reserve_mib = env_int("FNX_GPU1_RESERVE_MIB", (FNX_ARCH < 70 && NCARD == 2) ? 2048 : 0);
+    if (gpu1_reserve_mib < 0) throw std::runtime_error("FNX_GPU1_RESERVE_MIB: want MiB >= 0, got " + std::to_string(gpu1_reserve_mib));
+    auto card_reserve_mib = [&](int c) -> long long {
+        return c == 1 ? std::max(reserve_mib, gpu1_reserve_mib) : reserve_mib;
+    };
+    auto arena_reserve_mib = [&](int c) -> long long {
+        return (c == 1 && gpu1_reserve_mib > 0) ? card_reserve_mib(c) + reserve_mib : card_reserve_mib(c);
+    };
     if (m.arena) {
-        const long long reserve_mib = env_int("FNX_ARENA_RESERVE_MIB", 512);
-        if (reserve_mib < 0) throw std::runtime_error("FNX_ARENA_RESERVE_MIB: want MiB >= 0, got " + std::to_string(reserve_mib));
-        const size_t reserve = (size_t) reserve_mib << 20;
         // a card with less free VRAM than the slots, the reserve and the smallest own pool (two cards, another process
         // on it, a leak): the coldest experts that many slots' worth go to RAM, placed again, and the engine goes on.
         // Too few slots left for a window is still an error (Model::place_experts says so)
@@ -310,6 +330,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
                 ck(cudaSetDevice(m.cards[c].dev), "cudaSetDevice");
                 size_t fr = 0, tot = 0;
                 ck(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
+                const size_t reserve = (size_t) arena_reserve_mib(c) << 20;
                 const size_t sb = ec.slot_bytes[ec.arena_pool],
                              need = (size_t) ec.n[ec.arena_pool] * sb + reserve + (size_t) (extra_pages + 1) * kvp_page(c) * sizeof(uint16_t) +
                                     2 * pf_stage_bytes(c);
@@ -334,12 +355,13 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             ck(cudaSetDevice(m.cards[c].dev), "cudaSetDevice");
             size_t fr = 0, tot = 0;
             ck(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
+            const size_t reserve = (size_t) arena_reserve_mib(c) << 20;
             const size_t slots = (size_t) ec.n[ec.arena_pool] * ec.slot_bytes[ec.arena_pool], page = kvp_page(c) * sizeof(uint16_t);
             const int fit = fr > slots + reserve ? (int) ((fr - slots - reserve) / page) : 0;
             if (fit <= extra_pages)
                 throw std::runtime_error("FNX_ARENA: card " + std::to_string(c) + " has " + std::to_string(fr >> 20) + " MiB free: the arena's " +
                                          std::to_string(slots >> 20) + " MiB of slots, " + std::to_string(reserve >> 20) +
-                                         " MiB in reserve (FNX_ARENA_RESERVE_MIB) and the lanes' blocks do not fit");
+                                         " MiB in reserve (FNX_ARENA_RESERVE_MIB / FNX_GPU1_RESERVE_MIB) and the lanes' blocks do not fit");
             n_pages = std::min(n_pages, fit);
         }
         if (std::getenv("FNX_ARENA_BASE_PAGES")) {
@@ -360,6 +382,28 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         }
     } else {
         prefill_stages();
+        // Enforce per-card VRAM reserve in non-arena mode (especially GPU 1 display reserve >= 2,048 MiB)
+        for (int c = 0; c < NCARD; ++c) {
+            ck(cudaSetDevice(m.cards[c].dev), "cudaSetDevice");
+            size_t fr = 0, tot = 0;
+            ck(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
+            const size_t need_kv = (size_t) n_pages * kvp_page(c) * sizeof(uint16_t) + (size_t) n_pages * sizeof(int);
+            const size_t reserve = (size_t) card_reserve_mib(c) << 20;
+            const size_t target_pre_graph = (size_t) arena_reserve_mib(c) << 20;
+            if (fr < need_kv + reserve) {
+                const size_t short_mib = (need_kv + reserve - fr + (1u << 20) - 1) >> 20;
+                if (c == 1 && gpu1_reserve_mib > 0)
+                    throw std::runtime_error("fnx: card 1 (display) VRAM reserve violated by " + std::to_string(short_mib) +
+                                             " MiB (free " + std::to_string(fr >> 20) + " MiB, K/V " + std::to_string(need_kv >> 20) +
+                                             " MiB, reserve " + std::to_string(reserve >> 20) +
+                                             " MiB from FNX_GPU1_RESERVE_MIB / FNX_ARENA_RESERVE_MIB): raise FNX_EXPERT_RAM_GIB or lower context");
+                std::fprintf(stderr, "fnx: card %d: VRAM headroom %zu MiB below reserve %zu MiB after K/V (%zu MiB)\n",
+                             c, fr > need_kv ? (fr - need_kv) >> 20 : 0, reserve >> 20, need_kv >> 20);
+            } else if (c == 1 && gpu1_reserve_mib > 0 && fr < need_kv + target_pre_graph) {
+                std::fprintf(stderr, "fnx: card 1 (display): %zu MiB free after K/V (above %zu MiB reserve, below %zu MiB pre-graph target)\n",
+                             (fr - need_kv) >> 20, reserve >> 20, target_pre_graph >> 20);
+            }
+        }
     }
     for (int c = 0; c < NCARD; ++c) {
         CardBuf* b = cb_[c];
@@ -381,6 +425,10 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         } else {
             b->n_pages = n_pages;
             b->pool = dalloc<uint16_t>((size_t) b->n_pages * kvp_page(c));
+            size_t fr = 0, tot = 0;
+            ck(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
+            std::fprintf(stderr, "fnx: card %d: %d K/V pages (%d positions), %zu MiB free\n",
+                         c, b->n_pages, b->n_pages * KVP_POS, fr >> 20);
         }
         b->pt = dalloc<int>((size_t) b->n_pages);
         b->pg.pt = b->pt;
@@ -407,6 +455,15 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         }
     }
     for (CardBuf* b : cb_) { ck(cudaSetDevice(b->dev), "set"); ck(cudaDeviceSynchronize(), "init sync"); }
+    if (m_.cpu_experts) {
+        const long long cpu_threads = env_int("FNX_CPU_THREADS", 12);
+        if (cpu_threads < 1 || cpu_threads > 64)
+            throw std::runtime_error("FNX_CPU_THREADS: want 1..64, got " + std::to_string(cpu_threads));
+        ck(cudaSetDevice(m_.cards[0].dev), "cudaSetDevice");
+        cpu_pool_ = std::make_unique<CpuExpertPool>(m_, (int) cpu_threads);
+        std::fprintf(stderr, "fnx: cpu_experts: %lld worker threads, PolyWcBridge UVA slot=%p (card 0)\n",
+                     cpu_threads, (const void*) cpu_pool_->device_slot());
+    }
     lanes_.emplace_back();
     for (int i = m.arena ? arena_base_ : cb_[0]->n_pages; i-- > 0;) free_pages_.push_back(i);   // taken from the back: low pages first
     if (m.arena) {
@@ -930,13 +987,14 @@ void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint1
 
 // the FFN half: the hc read with the attention half's write folded in, the shared expert (in the router's and the
 // routed gate|up's launches on Q4_K layers, else on the second stream beside the router), the routing and the routed
-// experts, the weighted sum across the cards into b.bo_f
-void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl) {
+// experts (static hot VRAM + PolyWcBridge CPU cold experts when FNX_CPU_EXPERTS=1, else legacy ExpertCache / all-VRAM),
+// the weighted sum across the cards into b.bo_f
+void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl, int lyr) {
     const int P = T * TOPK, ffs = w.ff1 - w.ff0;
     hc_read(R, b.bo_a, b.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], m_.eps, b.mixed, b.inj_f, b.hcs, b.ring.err, T, b.st, b.xq);
     // the shared expert (rows P + t of part): its gate|up in the router's launch and its swiglu and down in the routed
-    // gate|up's (Q4_K experts), else on the second stream (a fork and a join cost ~5 us more than the launches' blocks)
-    const bool sh_in = L.gu_e.type == T_Q4_K && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF;
+    // gate|up's (Q4_K/Q6_K experts), else on the second stream (a fork and a join cost ~5 us more than the launches' blocks)
+    const bool sh_in = (L.gu_e.type == T_Q4_K || L.gu_e.type == T_Q6_K) && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF;
     if (!sh_in) {
         ck(cudaEventRecord(b.fork, b.st), "fork");
         ck(cudaStreamWaitEvent(b.st2, b.fork, 0), "fork wait");
@@ -945,27 +1003,35 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         q8s_gemv(L.sh_down.s, N, ffs, b.sh_hq, b.part + (size_t) P * N, N, T, b.st2);
         ck(cudaEventRecord(b.join, b.st2), "join");
     }
-    const int lyr = (int) (&L - w.L.data());
-    // experts in RAM: the router's last block plans this window's slots (the prefetch probe scores the picks against
-    // the slots as they were, so with it the plan runs after, in moe_cache)
-    const bool live = cache_live() && lyr >= 0 && lyr < NL;
-    const bool plan_in_router = live && !b.probe_cnt;
-    router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &w.ec : nullptr,
-                 lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu);
-    if (const int l = lyr; l >= 0 && l < NL) {
-        if (b.route_cnt) route_count(b.topi, P, b.route_cnt + (size_t) l * NEXP, b.st);
-        if (b.route_trace) fnx::route_trace(b.topi, P, l, b.route_trace, b.route_trace_len, b.route_trace_cap, b.st);
-        if (b.probe_cnt) {
-            if (l > 0)
-                probe_score(b.topi, b.probe_guess + (size_t) l * MAXT * TOPK, T, w.ec.n_slots ? w.ec.slot_of + (size_t) l * NEXP : nullptr,
-                            b.probe_cnt, b.st);
-            if (l + 1 < NL) {
-                gemv_f32(w.L[(size_t) l + 1].router, b.mixed, b.probe_logits, NEXP, N, T, b.st);
-                probe_guess(b.probe_logits, T, b.probe_guess + (size_t) (l + 1) * MAXT * TOPK, b.st);
+    const bool cpu_moe = m_.cpu_experts && lyr >= 0 && lyr < NL;
+    if (cpu_moe) {
+        router_route_split(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, w.resident_mask, lyr,
+                           b.ring.card, b.ring.card == 0 ? cpu_pool_->device_slot() : nullptr, ctl, b.st,
+                           sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu);
+        if (b.route_cnt) route_count(b.topi, P, b.route_cnt + (size_t) lyr * NEXP, b.st);
+        if (b.route_trace) fnx::route_trace(b.topi, P, lyr, b.route_trace, b.route_trace_len, b.route_trace_cap, b.st);
+    } else {
+        // experts in RAM: the router's last block plans this window's slots (the prefetch probe scores the picks against
+        // the slots as they were, so with it the plan runs after, in moe_cache)
+        const bool live = cache_live() && lyr >= 0 && lyr < NL;
+        const bool plan_in_router = live && !b.probe_cnt;
+        router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &w.ec : nullptr,
+                     lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu);
+        if (const int l = lyr; l >= 0 && l < NL) {
+            if (b.route_cnt) route_count(b.topi, P, b.route_cnt + (size_t) l * NEXP, b.st);
+            if (b.route_trace) fnx::route_trace(b.topi, P, l, b.route_trace, b.route_trace_len, b.route_trace_cap, b.st);
+            if (b.probe_cnt) {
+                if (l > 0)
+                    probe_score(b.topi, b.probe_guess + (size_t) l * MAXT * TOPK, T, w.ec.n_slots ? w.ec.slot_of + (size_t) l * NEXP : nullptr,
+                                b.probe_cnt, b.st);
+                if (l + 1 < NL) {
+                    gemv_f32(w.L[(size_t) l + 1].router, b.mixed, b.probe_logits, NEXP, N, T, b.st);
+                    probe_guess(b.probe_logits, T, b.probe_guess + (size_t) (l + 1) * MAXT * TOPK, b.st);
+                }
             }
+            // the planned experts copied into their slots before the MoE kernels read the layer's tables
+            if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, w.ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs);
         }
-        // the planned experts copied into their slots before the MoE kernels read the layer's tables
-        if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, w.ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs);
     }
     if (sh_in) moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
     else moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st);
@@ -975,7 +1041,29 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     m.part = b.part;
     m.topw = b.topw;
     m.logits = b.logits;
+    if (cpu_moe && b.ring.card == 0) {
+        wc_bridge_wait_merge(cpu_pool_->device_slot(), ctl, lyr, T, b.cold_out, b.ring.err, b.st);
+        m.cold_out = b.cold_out;
+    }
     ring_sum(b.ring, b.bo_f, T, (const unsigned*) (ctl + 1), call, b.st, m);
+}
+
+template <class DenseFn>
+void lm_head_pass(CardBuf& b, const CardW& w, float eps, int T, DenseFn&& run_dense) {
+    if (w.out_6p2.hi) {
+        hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, Q8S{}, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st,
+                b.head_xq);
+        if (T <= 5) {
+            vhead_verify_6p2(w.out_6p2, b.head_xq, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.vh_work, b.st);
+        } else {
+            vhead_all_logits_6p2(w.out_6p2, b.head_xq, b.head_logits, T, b.st);
+            argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
+        }
+    } else {
+        hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, Q8S{}, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+        run_dense();
+        argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
+    }
 }
 
 // every card's work for one window of T rows, in stream order (captured into a graph unless dumping)
@@ -1038,7 +1126,7 @@ void Engine::enqueue(int T, bool dumps) {
         dd("hc_mixed", l, cb_[0]->mixed, N);
         dd("mixer_out", l, cb_[0]->bo_a, N);
         // ---- FFN half
-        each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl); });
+        each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl, l); });
         ++call;
         dd("ffn_mixed", l, cb_[0]->mixed, N);
         dd("ffn_out", l, cb_[0]->bo_f, N);
@@ -1047,9 +1135,7 @@ void Engine::enqueue(int T, bool dumps) {
     }
     // ---- head: the final mixer (no injection) with the last write folded in, then this card's vocabulary
     each([&](int c, CardBuf& b, const CardW& w) {
-        hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
-        dense(w.out, b.xq, b.head_logits, b, T);
-        argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
+        lm_head_pass(b, w, eps, T, [&] { dense(w.out, b.xq, b.head_logits, b, T); });
     });
     dd("result_norm", -1, cb_[0]->mixed, N);
 }
@@ -1121,13 +1207,11 @@ void Engine::enqueue_batch(const std::vector<int>& lanes) {
             ring_sum(b.ring, b.bo_a, T, (const unsigned*) (b.ctl + 1), call, b.st);
         });
         ++call;
-        each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl); });
+        each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl, l); });
         ++call;
     }
     each([&](int, CardBuf& b, const CardW& w) {
-        hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
-        dense(w.out, b.xq, b.head_logits, b, T);
-        argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
+        lm_head_pass(b, w, eps, T, [&] { dense(w.out, b.xq, b.head_logits, b, T); });
     });
 }
 
@@ -1206,13 +1290,11 @@ void Engine::enqueue_rows(const std::vector<int>& lanes, const std::vector<int>&
             ring_sum(b.ring, b.bo_a, T, (const unsigned*) (b.ctl + 1), call, b.st);
         });
         ++call;
-        each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl); });
+        each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl, l); });
         ++call;
     }
     each([&](int, CardBuf& b, const CardW& w) {
-        hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
-        dense(w.out, b.xq, b.head_logits, b, T);
-        argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
+        lm_head_pass(b, w, eps, T, [&] { dense(w.out, b.xq, b.head_logits, b, T); });
     });
 }
 
@@ -1240,7 +1322,7 @@ void Engine::mtp_attach(const Mtp& mtp) {
         b.lanes[0].mtp_ring = dalloc<uint16_t>((size_t) qsa_ring_rows() * 128);   // lanes after 0 carry theirs in their blocks
         b.mtp_qsa_ring = b.lanes[(size_t) cur_].mtp_ring;
         b.mtp_qsa_pooled = b.mtp_kc + 2 * kvp_rows_halves(c, kv_q8());
-        b.mtp_logits = dalloc<float>((size_t) MAXT * std::max(1, mc.dv1 - mc.dv0));
+        b.mtp_logits = dalloc<float>(mtp.shared_6p2 ? (size_t) 1 : (size_t) MAXT * std::max(1, mc.dv1 - mc.dv0));
         b.mtp_bv = dalloc<float>(MAXT);
         b.mtp_bi = dalloc<int>(MAXT);
         b.mtp_ctl = dalloc<int>(2);
@@ -1261,8 +1343,12 @@ void Engine::mtp_attach(const Mtp& mtp) {
         h_.mtp_tk_i = halloc<int>((size_t) NCARD * TOPK_N);
         h_.mtp_tk_err = halloc<unsigned>(NCARD);
     }
-    draft_index_.assign((size_t) m_.vocab, -1);
-    for (size_t i = 0; i < mtp.vocab.size(); ++i) draft_index_[(size_t) mtp.vocab[i]] = (int) i;
+    if (!mtp.shared_6p2) {
+        draft_index_.assign((size_t) m_.vocab, -1);
+        for (size_t i = 0; i < mtp.vocab.size(); ++i) draft_index_[(size_t) mtp.vocab[i]] = (int) i;
+    } else {
+        draft_index_.clear();
+    }
     if (!h_.bv) {
         h_.bv = halloc<float>(NCARD * MAXT);
         h_.bi = halloc<int>(NCARD * MAXT);
@@ -1298,16 +1384,22 @@ void Engine::mtp_enqueue(int T) {
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];
         ck(cudaSetDevice(b.dev), "set");
-        ffn_half(T, 1, b, m_.cards[c], mtp_->cards[c].L, b.mtp_R, b.mtp_ctl);
+        ffn_half(T, 1, b, m_.cards[c], mtp_->cards[c].L, b.mtp_R, b.mtp_ctl, -1);
     }
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];
+        const CardW& w = m_.cards[c];
         const MtpCard& mc = mtp_->cards[c];
         ck(cudaSetDevice(b.dev), "set");
-        hc_read(b.mtp_R, b.bo_f, b.inj_f, mc.mix_norm, mc.mix_down, mc.mix_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
-        dense(mc.head, b.xq, b.mtp_logits, b, T);
-        penalize_row(b.mtp_logits + (size_t) (T - 1) * (mc.dv1 - mc.dv0), mc.dv1 - mc.dv0, b.mtp_pen, b.mtp_pen_par, b.st);
-        argmax(b.mtp_logits, mc.dv1 - mc.dv0, T, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.ring.err, b.st);
+        hc_read(b.mtp_R, b.bo_f, b.inj_f, mc.mix_norm, mc.mix_down, mc.mix_up, Q8S{}, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+        if (mtp_->shared_6p2) {
+            vhead_mtp_fast_6p2(w.out_6p2, w.out_cent_f16, w.out_cluster_off, w.out_n_clusters, mtp_->top_clusters, b.xq, T, w.v0,
+                               b.mtp_pen, b.mtp_pen_par, b.mtp_bv, b.mtp_bi, b.am_keys, b.ring.err, b.vh_work, b.st);
+        } else {
+            dense(mc.head, b.xq, b.mtp_logits, b, T);
+            penalize_row(b.mtp_logits + (size_t) (T - 1) * (mc.dv1 - mc.dv0), mc.dv1 - mc.dv0, b.mtp_pen, b.mtp_pen_par, b.st);
+            argmax(b.mtp_logits, mc.dv1 - mc.dv0, T, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.ring.err, b.st);
+        }
     }
 }
 

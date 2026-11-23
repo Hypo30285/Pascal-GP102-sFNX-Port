@@ -74,6 +74,23 @@ struct Q8S {
     uint16_t* d = nullptr;
 };
 
+// Lossless 6+2 interval split-plane LM head (cols % 512 == 0, S = cols / 512).
+// Stage 1 reads hi + d (+ row_l2); Stage 2 reads lo only for interval survivors -> 0-ULP Q8_0 logits.
+// 128-byte coalesced SoA per superblock s in [0, S), lane in [0, 32):
+//   hi[(r * S + s) * 96 + w * 32 + lane] for w in 0..2  (24 B/block = 3x 128B warp loads)
+//   lo[(r * S + s) * 32 + lane]                         (8 B/block  = 1x 128B warp load)
+//   d [r * (cols / 32) + b]                             (2 B/block, exact Q8_0 f16 scale bits)
+struct VHead6p2 {
+    uint32_t* hi = nullptr;
+    uint32_t* lo = nullptr;
+    uint16_t* d = nullptr;
+    void* row_meta = nullptr;          // [n_out] float2: {res_l2, blk_l1}
+    int32_t* perm_to_vocab = nullptr;  // [n_out]: local row -> card vocab offset, null if identity
+    int32_t* vocab_to_local = nullptr; // [n_out]: card vocab offset -> local row, null if identity
+    int n_in = 0;
+    int n_out = 0;
+};
+
 // device weight slice: raw ggml blocks, row-major over output rows
 struct DW {
     void* p = nullptr;
@@ -116,12 +133,27 @@ struct ExpertCache {
     int* lent = nullptr;                 // [EC_POOLS]
 };
 
+// Single un-duplicated pinned host view of a cold routed expert in FNX_CPU_EXPERTS=1 mode:
+// laid out as contiguous 2-half slices [card0_gu | card1_gu] and [card0_dn | card1_dn] so CPU decode runs full
+// FF=640 from RAM with 0 PCIe weight DMA, while prefill stages each card's half directly into VRAM stage[l & 1].
+struct ColdExpertInfo {
+    const uint8_t* gu_half[2] = {nullptr, nullptr};   // card 0 [0..320) & card 1 [320..640) stacked [gate; up] rows
+    const uint8_t* dn_half[2] = {nullptr, nullptr};   // card 0 [0..320) & card 1 [320..640) column-sliced down rows
+    uint32_t gu_type = 0;                             // T_Q4_K, T_Q6_K, or T_Q8_0
+    uint32_t dn_type = 0;                             // T_Q8_0 (or T_Q4_K/T_Q6_K)
+    size_t gu_row_bytes = 0;                          // bytes per N=2560 row
+    size_t dn_row_bytes = 0;                          // bytes per FF/2=320 row
+    size_t gu_half_bytes = 0;                         // 2 * (FF/2) * gu_row_bytes
+    size_t dn_half_bytes = 0;                         // N * dn_row_bytes
+    bool is_cold = false;                             // true iff NOT permanently resident in VRAM
+};
+
 struct LayerW {
     // copied
     const float* hc_norm[2] = {};      // attn, ffn: [hc*n] f32
     Q8S hc_down[2];                    // [LR][D]
     Q8S hc_up[2];                      // [D][LR]
-    uint16_t* hc_inj[2] = {};          // bf16 [HC][D]
+    Q8S hc_inj[2] = {};                // int8+f16 [HC][D] (per-32-element hc8)
     float* router = nullptr;           // f32 [NEXP + 1][N]: the router's rows, then the shared expert's gate
     // recurrent slice: this card's key heads and their value heads
     DW qkv, z, ssm_out;                // qkv rows: q (nk*HS), k (nk*HS), v (nv*HS); ssm_out: [N][nv*HS]
@@ -186,6 +218,10 @@ struct CardW {
     const float* head_norm = nullptr;
     Q8S head_down, head_up;
     DW out;                            // output head rows [v0, v1)
+    VHead6p2 out_6p2;                  // optional 6+2 split-plane LM head (FNX_LMHEAD_6P2=1)
+    const uint16_t* out_cent_f16 = nullptr;   // [out_n_clusters][N] unit centroids for clustered MTP
+    const int32_t* out_cluster_off = nullptr; // [out_n_clusters + 1] local row CSR offsets
+    int out_n_clusters = 0;
     // PLE layer weights (copied)
     DW ple_key, ple_value;
     float* ple_norm_key = nullptr;
@@ -199,6 +235,7 @@ struct CardW {
     std::vector<int> ec_owner0, ec_slot0;   // ec.owner / slot_of as loaded (an arena engine starts from them again)
     std::vector<void*> expert_mem;     // what Model::place_experts allocated (freed by free_experts)
     size_t expert_bytes = 0;
+    uint8_t* resident_mask = nullptr;  // [NL * NEXP] device mask: 1 = VRAM resident, 0 = CPU cold (FNX_CPU_EXPERTS=1)
 };
 
 // the draft (MTP) layer on one card: an attention layer (hc [0] before the attention, [1] before the MoE), its input
@@ -222,6 +259,8 @@ struct Model;
 struct Mtp {
     std::vector<MtpCard> cards;        // one per Model card, on the same devices
     std::vector<int> vocab;            // the draft vocabulary: head row -> token id
+    bool shared_6p2 = false;           // true when draft head shares CardW::out_6p2 (FNX_MTP_FASTHEAD)
+    int top_clusters = 0;              // clusters searched per draft step when shared_6p2 is true
     // vocab_file: the draft vocabulary (int32 token ids); empty: rt_dir/draft_vocab.bin. The 27B: rt_dir "nextn" (its
     // layer is the GGUF's), vocab_file required
     Mtp(const Model& m, const std::string& rt_dir, const std::string& vocab_file = "");
@@ -258,7 +297,21 @@ struct Model {
     // engine's arena and lent to the K/V pool coldest first as it grows (score: the profile's, per byte; higher is hotter)
     bool arena = false;
     std::vector<double> score;           // [NL * NEXP]
+    // FNX_CPU_EXPERTS=1 (default on FNX_ARCH < 70 && NCARD == 2 with partial VRAM residency):
+    // single un-duplicated pinned host buffer for cold experts (resident[l][e] == 0); resident experts live only in VRAM
+    bool cpu_experts = false;
+    size_t gpu1_reserve_bytes = 0;       // FNX_GPU1_RESERVE_MIB (default 2048 MiB on FNX_ARCH < 70 && NCARD == 2)
+    size_t cold_host_bytes = 0;          // total pinned host bytes allocated for cold experts
+    std::vector<ColdExpertInfo> cold_experts;   // [NL * NEXP] when cpu_experts is true
+    std::vector<void*> cold_host_allocs;        // freed in ~Model()
+    std::vector<size_t> cold_host_alloc_sizes;  // byte sizes matching cold_host_allocs
+    bool cold_host_via_mmap = false;            // true when cold_host_allocs used mmap+mlock+cudaHostRegister
+    bool has_engram_override = false;           // true when FNX_ENGRAM_GGUF supplied per_layer_token_embd.weight
+    bool has_hybrid_splice = false;             // true when FNX_HYBRID_Q6_GGUF spliced routed expert tensors
     explicit Model(const std::string& gguf_first_shard, Load how = Load::PLAIN, Store* store = nullptr, const std::string* image = nullptr);
+    ~Model();
+    Model(const Model&) = delete;
+    Model& operator=(const Model&) = delete;
     // the residency and arena settings (FNX_EXPERT_RAM_GIB, FNX_ARENA, FNX_EXPERT_PROFILE) read again
     void choose_residency();
     // a worker's routed experts from their host copies: every one in VRAM, or an ExpertCache (with the arena: its

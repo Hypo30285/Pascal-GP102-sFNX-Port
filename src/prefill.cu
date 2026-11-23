@@ -89,13 +89,16 @@ __global__ void k_bf16_f32(const uint16_t* __restrict__ x, size_t n, float* __re
 
 // ---------------------------------------------------------------- hyper-connection read, batched
 // row t: R' = R + bo * 2 sigmoid(inj / HC) per stream (written back), rs[t][c] = 1 / sqrt(mean R'^2 + eps), and
-// xn = R' * w_norm * rs as f16 (the down mix's input); with w_inj (bf16 rows of D) also inject_out[t][r] = w_inj[r] . xn
+// xn = R' * w_norm * rs as f16 (the down mix's input); with w_inj (hc8 Q8S rows of D) also inject_out[t][r] = w_inj[r] . xn
 // from the same f32 xn while it is in registers (k_hcb_mixinj then needs no second pass over R)
+__device__ __forceinline__ float hc8_val(const Q8S& w, size_t idx) {
+    return (float) w.q[idx] * __half2float(__ushort_as_half(w.d[idx >> 5]));
+}
 constexpr int HCB_THREADS = 256, HCB_PER = N / HCB_THREADS;
 static_assert(N % HCB_THREADS == 0, "stream elements per thread");
 __global__ void __launch_bounds__(HCB_THREADS) k_hcb_prep(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
                                                           const float* __restrict__ wn, float* __restrict__ rs, __half* __restrict__ xh,
-                                                          float eps, const uint16_t* __restrict__ w_inj, float* __restrict__ inject_out) {
+                                                          float eps, Q8S w_inj, float* __restrict__ inject_out) {
     const int t = blockIdx.x, i0 = threadIdx.x;
     __shared__ float sh[32];
     __shared__ float shi[HC][HCB_THREADS / 32];
@@ -122,12 +125,12 @@ __global__ void __launch_bounds__(HCB_THREADS) k_hcb_prep(float* __restrict__ R,
             const int i = i0 + k * HCB_THREADS;
             const float xn = v[k] * wn[c * N + i] * r_s;
             xh[(size_t) t * D + c * N + i] = __float2half(xn);
-            if (w_inj)
+            if (w_inj.q)
 #pragma unroll
-                for (int r = 0; r < HC; ++r) acc[r] = fmaf(__uint_as_float((unsigned) w_inj[(size_t) r * D + c * N + i] << 16), xn, acc[r]);
+                for (int r = 0; r < HC; ++r) acc[r] = fmaf(hc8_val(w_inj, (size_t) r * D + c * N + i), xn, acc[r]);
         }
     }
-    if (!w_inj) return;
+    if (!w_inj.q) return;
     const int lane = i0 & 31, warp = i0 >> 5;
 #pragma unroll
     for (int r = 0; r < HC; ++r) {
@@ -146,14 +149,14 @@ __global__ void __launch_bounds__(HCB_THREADS) k_hcb_prep(float* __restrict__ R,
 __global__ void k_hcb_lo(const float* __restrict__ down, int n, __half* __restrict__ lo) {
     for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n; e += gridDim.x * blockDim.x) lo[e] = __float2half(pf_silu(down[e] / (float) HC));
 }
-// per row t: mixed[t][i] = mean_c xn_c[i] * sigmoid(up_c[i]), then (with w_inj: bf16 rows of D) inject[t][r] =
+// per row t: mixed[t][i] = mean_c xn_c[i] * sigmoid(up_c[i]), then (with w_inj: hc8 Q8S rows of D) inject[t][r] =
 // w_inj[r] . xn[t]: warps 4 r .. 4 r + 3 take a quarter of D each, their sums added in order. xn = R wn rs,
 // recomputed with k_hcb_prep's operations (so its values) rather than kept as a copy
 constexpr int HCM_THREADS = 512, HCM_WPR = HCM_THREADS / 32 / HC;   // warps per inject row
 __global__ void __launch_bounds__(HCM_THREADS) k_hcb_mixinj(const float* __restrict__ R, const float* __restrict__ wn,
                                                             const float* __restrict__ rs, const float* __restrict__ up,
                                                             float* __restrict__ mixed, __half* __restrict__ mixh,
-                                                            const uint16_t* __restrict__ w_inj,
+                                                            Q8S w_inj,
                                                             float* __restrict__ inj) {
     const int t = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const float* Rt = R + (size_t) t * D;
@@ -168,13 +171,13 @@ __global__ void __launch_bounds__(HCM_THREADS) k_hcb_mixinj(const float* __restr
         mixed[(size_t) t * N + i] = m;
         mixh[(size_t) t * N + i] = __float2half(m);
     }
-    if (!w_inj) return;
+    if (!w_inj.q) return;
     __shared__ float part[HC][HCM_WPR];
     const int r = warp / HCM_WPR, q = warp % HCM_WPR;
     constexpr int QLEN = D / HCM_WPR;
     float acc = 0.f;
     for (int i = q * QLEN + lane; i < (q + 1) * QLEN; i += 32)
-        acc += __uint_as_float((unsigned) w_inj[(size_t) r * D + i] << 16) * (Rt[i] * wn[i] * r_s[i / N]);
+        acc += hc8_val(w_inj, (size_t) r * D + i) * (Rt[i] * wn[i] * r_s[i / N]);
     acc = pf_wsum(acc);
     if (lane == 0) part[r][q] = acc;
     __syncthreads();
@@ -381,9 +384,148 @@ struct Engine::Pf {
     size_t staged = 0, in_place = 0;  // the pass's expert bytes copied in, and left in RAM
     cudaStream_t cs = nullptr;
     cudaEvent_t ev_ready[2], ev_done[2];   // stage[k] filled; its layer's experts done with
+    // FNX_CPU_EXPERTS=1: static resident VRAM pointers (D2H-copied once in prefill_stages) and current table mode
+    std::vector<const char*> res_gu, res_dn;
+    int cpu_table_mode = 0;           // 0: unbuilt, 1: in-place UVA, 2: staged into stage[l & 1] + overflow UVA
 };
 
 namespace {
+// Z420 sm61-port: GP102 (__dp4a INT8, 47 TOPS/card) prefill GEMM over the split Q8_0 layout, avoiding V100's
+// k_q8s_f16 dequantization and Pascal's 1:64 FP16 trap in cublasGemmEx(CUDA_R_16F).
+__global__ void __launch_bounds__(256) k_pf_quant_q8(const __half* __restrict__ X, size_t nblk, int8_t* __restrict__ xq,
+                                                     float* __restrict__ xd) {
+    const size_t b = ((size_t) blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (b >= nblk) return;
+    const int lane = threadIdx.x & 31;
+    const float v = __half2float(X[b * 32 + lane]);
+    const float amax = pf_wmax(fabsf(v));
+    const float scale = amax / 127.0f;
+    const float iscale = amax > 0.0f ? 127.0f / amax : 0.0f;
+    xq[b * 32 + lane] = (int8_t) __float2int_rn(v * iscale);
+    if (lane == 0) xd[b] = scale;
+}
+
+template <int BN, int TC>
+__global__ void __launch_bounds__(256, 4) k_pf_q8s_dp4a(const int8_t* __restrict__ wq, const uint16_t* __restrict__ wd,
+                                                        const int8_t* __restrict__ xq, const float* __restrict__ xd,
+                                                        float* __restrict__ out, int rows, int cols, int C, int ldo) {
+    constexpr int BM = 64, TR = 4;
+    static_assert(BM / TR * (BN / TC) == 256, "256 threads cover BM x BN");
+    __shared__ int sw[8][BM + 1];
+    __shared__ int sx[8][BN + 1];
+    __shared__ float sdw[BM];
+    __shared__ float sdx[BN];
+
+    const int r0 = blockIdx.x * BM, t0 = blockIdx.y * BN, tid = threadIdx.x, nb = cols >> 5;
+    const int tr = (tid / (BN / TC)) * TR, tc = (tid % (BN / TC)) * TC;
+    const int half_id = tid & 127, lr = half_id >> 1, lk4 = (half_id & 1) * 4;
+    float acc[TR][TC] = {};
+
+    for (int b = 0; b < nb; ++b) {
+        if (tid < 128) {
+            const int gr = r0 + lr;
+            const int4 w4 = gr < rows ? __ldg(reinterpret_cast<const int4*>(wq + (size_t) gr * cols + b * 32 + lk4 * 4))
+                                      : make_int4(0, 0, 0, 0);
+            sw[lk4 + 0][lr] = w4.x;
+            sw[lk4 + 1][lr] = w4.y;
+            sw[lk4 + 2][lr] = w4.z;
+            sw[lk4 + 3][lr] = w4.w;
+            if ((tid & 1) == 0) sdw[lr] = gr < rows ? __half2float(__ushort_as_half(__ldg(wd + (size_t) gr * nb + b))) : 0.0f;
+        } else if (lr < BN) {
+            const int gt = t0 + lr;
+            const int4 x4 = gt < C ? __ldg(reinterpret_cast<const int4*>(xq + (size_t) gt * cols + b * 32 + lk4 * 4))
+                                   : make_int4(0, 0, 0, 0);
+            sx[lk4 + 0][lr] = x4.x;
+            sx[lk4 + 1][lr] = x4.y;
+            sx[lk4 + 2][lr] = x4.z;
+            sx[lk4 + 3][lr] = x4.w;
+            if ((tid & 1) == 0) sdx[lr] = gt < C ? __ldg(xd + (size_t) gt * nb + b) : 0.0f;
+        }
+        __syncthreads();
+
+        int dp[TR][TC] = {};
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            int wv[TR], xv[TC];
+#pragma unroll
+            for (int i = 0; i < TR; ++i) wv[i] = sw[k][tr + i];
+#pragma unroll
+            for (int j = 0; j < TC; ++j) xv[j] = sx[k][tc + j];
+#pragma unroll
+            for (int i = 0; i < TR; ++i) {
+#pragma unroll
+                for (int j = 0; j < TC; ++j) dp[i][j] = __dp4a(wv[i], xv[j], dp[i][j]);
+            }
+        }
+        float dw[TR], dx[TC];
+#pragma unroll
+        for (int i = 0; i < TR; ++i) dw[i] = sdw[tr + i];
+#pragma unroll
+        for (int j = 0; j < TC; ++j) dx[j] = sdx[tc + j];
+#pragma unroll
+        for (int i = 0; i < TR; ++i) {
+#pragma unroll
+            for (int j = 0; j < TC; ++j) acc[i][j] = fmaf((float) dp[i][j], dw[i] * dx[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < TC; ++j) {
+        const int gt = t0 + tc + j;
+        if (gt < C) {
+#pragma unroll
+            for (int i = 0; i < TR; ++i) {
+                const int gr = r0 + tr + i;
+                if (gr < rows) out[(size_t) gt * ldo + gr] = acc[i][j];
+            }
+        }
+    }
+}
+
+bool use_pf_dp4a() {
+    static const bool v = [] {
+        const char* e = std::getenv("FNX_PF_DP4A");
+        if (e && std::strcmp(e, "0") && std::strcmp(e, "1"))
+            throw std::runtime_error(std::string("FNX_PF_DP4A: 0 or 1, not '") + e + "'");
+        return e ? !std::strcmp(e, "1") : (FNX_ARCH < 70);
+    }();
+    return v;
+}
+
+void pf_q8s_dp4a(Engine::Pf& p, const Q8S& w, int rows, int cols, const __half* X, int C, float* out, int ldo, cudaStream_t s) {
+    if (!w.q) throw std::runtime_error("prefill: a dense matrix without the split Q8_0 layout");
+    if (cols % 32 != 0) throw std::runtime_error("prefill: a dense matrix's columns are not a multiple of 32");
+    if (C <= 0) return;
+    const int nb = cols / 32;
+    const size_t wh_bytes = PF_WH * sizeof(__half);
+    const size_t per_tok = (size_t) cols + (size_t) nb * sizeof(float);
+    int max_c = (int) ((wh_bytes - 512) / per_tok);
+    max_c = std::max(64, (max_c / 64) * 64);
+    for (int c0 = 0; c0 < C; c0 += max_c) {
+        const int nc = std::min(max_c, C - c0);
+        const size_t nblk = (size_t) nc * nb;
+        const size_t xd_bytes = (nblk * sizeof(float) + 255) & ~size_t(255);
+        const size_t xq_bytes = (size_t) nc * cols;
+        if (xd_bytes + xq_bytes > wh_bytes)
+            throw std::runtime_error("prefill: X q8 staging exceeds wh buffer");
+        float* xd = reinterpret_cast<float*>(p.wh);
+        int8_t* xq = reinterpret_cast<int8_t*>(p.wh) + xd_bytes;
+        const __half* xc = X + (size_t) c0 * cols;
+        float* oc = out + (size_t) c0 * ldo;
+        k_pf_quant_q8<<<(unsigned) ((nblk + 7) / 8), 256, 0, s>>>(xc, nblk, xq, xd);
+        if (nc <= 16) {
+            k_pf_q8s_dp4a<16, 1><<<dim3((rows + 63) / 64, 1), 256, 0, s>>>(w.q, w.d, xq, xd, oc, rows, cols, nc, ldo);
+        } else if (nc <= 32) {
+            k_pf_q8s_dp4a<32, 2><<<dim3((rows + 63) / 64, 1), 256, 0, s>>>(w.q, w.d, xq, xd, oc, rows, cols, nc, ldo);
+        } else if (nc <= 48) {
+            k_pf_q8s_dp4a<48, 3><<<dim3((rows + 63) / 64, 1), 256, 0, s>>>(w.q, w.d, xq, xd, oc, rows, cols, nc, ldo);
+        } else {
+            k_pf_q8s_dp4a<64, 4><<<dim3((rows + 63) / 64, (nc + 63) / 64), 256, 0, s>>>(w.q, w.d, xq, xd, oc, rows, cols, nc, ldo);
+        }
+    }
+}
+
 // out[t * ldo + r] = W[r] . X[t] for t < C: W f16 [rows][cols], X f16 [C][cols]
 void pf_gemm(Engine::Pf& p, const __half* W, int rows, int cols, const __half* X, int C, float* out, int ldo, cudaStream_t s) {
     if (std::getenv("FNX_PF_GEMM_LOG")) {   // each shape once (for tools/gemm_bench.cu)
@@ -403,9 +545,13 @@ void pf_gemm(Engine::Pf& p, const __half* W, int rows, int cols, const __half* X
                          CUDA_R_32F, ldo, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), "gemm");
     }
 }
-// out = W . xh for a split-layout Q8_0 matrix (dequantized to f16), xh: C rows of cols as f16 already in p.xh
+// out = W . xh for a split-layout Q8_0 matrix (dp4a on sm_61 by default; dequantized to f16 for cuBLAS otherwise)
 void pf_dense_xh(Engine::Pf& p, const Q8S& w, int rows, int cols, int C, float* out, int ldo, cudaStream_t s) {
     if (!w.q) throw std::runtime_error("prefill: a dense matrix without the split Q8_0 layout");
+    if (use_pf_dp4a()) {
+        pf_q8s_dp4a(p, w, rows, cols, p.xh, C, out, ldo, s);
+        return;
+    }
     if (cols % 32 != 0 || (size_t) cols > PF_WH) throw std::runtime_error("prefill: a dense matrix's rows don't fit the f16 staging");
     // in slices of rows that fit the staging buffer (each slice: its rows of out)
     const int slice = (int) std::min<size_t>(rows, PF_WH / cols / 128 * 128);   // whole 128-row tiles
@@ -427,27 +573,33 @@ void pf_sgemm(Engine::Pf& p, const float* W, int rows, int cols, const float* x,
 }
 // the hyper-connection read for C rows (see hc.cuh for what it computes)
 void pf_hc_read(Engine::Pf& p, float* R, const float* bo, const float* inj_prev, const float* w_norm, const Q8S& w_down, const Q8S& w_up,
-                const uint16_t* w_inj, float eps, float* mixed, float* inject, int C, cudaStream_t s) {
+                const Q8S& w_inj, float eps, float* mixed, float* inject, int C, cudaStream_t s) {
     k_hcb_prep<<<C, HCB_THREADS, 0, s>>>(R, bo, inj_prev, w_norm, p.rs, p.xh, eps, w_inj, inject);   // the inject rows here
-    k_q8s_f16<<<grid_for((size_t) LR * D), 256, 0, s>>>(w_down.q, w_down.d, (size_t) LR * D, p.wh);
-    pf_gemm(p, p.wh, LR, D, p.xh, C, p.lo32, LR, s);
-    k_hcb_lo<<<grid_for((size_t) C * LR), 256, 0, s>>>(p.lo32, C * LR, p.lo16);
-    k_q8s_f16<<<grid_for((size_t) D * LR), 256, 0, s>>>(w_up.q, w_up.d, (size_t) D * LR, p.wh);
-    if (p.f16acc) {
-        // pf_gemm's f16 path stages through up32: here up32 is the result, so stage through xh (free once lo is made)
-        const __half one = __float2half(1.0f), zero = __float2half(0.0f);
-        ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, D, C, LR, &one, p.wh, CUDA_R_16F, LR, p.lo16, CUDA_R_16F, LR, &zero, p.xh,
-                         CUDA_R_16F, D, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), "gemm f16 (hc up)");
-        k_f16_f32<<<grid_for((size_t) D * C), 256, 0, s>>>(p.xh, C, D, p.up32, D);
+    if (use_pf_dp4a()) {
+        pf_q8s_dp4a(p, w_down, LR, D, p.xh, C, p.lo32, LR, s);
+        k_hcb_lo<<<grid_for((size_t) C * LR), 256, 0, s>>>(p.lo32, C * LR, p.lo16);
+        pf_q8s_dp4a(p, w_up, D, LR, p.lo16, C, p.up32, D, s);
     } else {
-        const float one = 1.0f, zero = 0.0f;
-        ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, D, C, LR, &one, p.wh, CUDA_R_16F, LR, p.lo16, CUDA_R_16F, LR, &zero, p.up32,
-                         CUDA_R_32F, D, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), "gemm (hc up)");
+        k_q8s_f16<<<grid_for((size_t) LR * D), 256, 0, s>>>(w_down.q, w_down.d, (size_t) LR * D, p.wh);
+        pf_gemm(p, p.wh, LR, D, p.xh, C, p.lo32, LR, s);
+        k_hcb_lo<<<grid_for((size_t) C * LR), 256, 0, s>>>(p.lo32, C * LR, p.lo16);
+        k_q8s_f16<<<grid_for((size_t) D * LR), 256, 0, s>>>(w_up.q, w_up.d, (size_t) D * LR, p.wh);
+        if (p.f16acc) {
+            // pf_gemm's f16 path stages through up32: here up32 is the result, so stage through xh (free once lo is made)
+            const __half one = __float2half(1.0f), zero = __float2half(0.0f);
+            ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, D, C, LR, &one, p.wh, CUDA_R_16F, LR, p.lo16, CUDA_R_16F, LR, &zero, p.xh,
+                             CUDA_R_16F, D, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), "gemm f16 (hc up)");
+            k_f16_f32<<<grid_for((size_t) D * C), 256, 0, s>>>(p.xh, C, D, p.up32, D);
+        } else {
+            const float one = 1.0f, zero = 0.0f;
+            ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, D, C, LR, &one, p.wh, CUDA_R_16F, LR, p.lo16, CUDA_R_16F, LR, &zero, p.up32,
+                             CUDA_R_32F, D, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), "gemm (hc up)");
+        }
     }
-    k_hcb_mixinj<<<C, HCM_THREADS, 0, s>>>(R, w_norm, p.rs, p.up32, mixed, p.xh, nullptr, nullptr);   // prep made the inject rows
+    k_hcb_mixinj<<<C, HCM_THREADS, 0, s>>>(R, w_norm, p.rs, p.up32, mixed, p.xh, Q8S{}, nullptr);   // prep made the inject rows
     // FNX_PF_HC_CHECK=1 (debugging): the inject rows the way k_hcb_mixinj made them, against prep's
     static const bool check = std::getenv("FNX_PF_HC_CHECK") != nullptr;
-    if (check && w_inj) {
+    if (check && w_inj.q) {
         float* ref = nullptr;
         float* scratch = nullptr;
         ckc(cudaMalloc(&ref, (size_t) C * HC * 4), "hc check");
@@ -479,7 +631,10 @@ __global__ void k_pfr_addend(float* __restrict__ x, const float* __restrict__ pa
         const int t = (int) (e / N), i = (int) (e % N);
         float s = 0.f;
 #pragma unroll
-        for (int k = 0; k < TOPK; ++k) s = fmaf(topw[t * TOPK + k], part[((size_t) t * TOPK + k) * N + i], s);
+        for (int k = 0; k < TOPK; ++k) {
+            const float w = topw[t * TOPK + k];
+            if (w != 0.f) s = fmaf(w, part[((size_t) t * TOPK + k) * N + i], s);
+        }
         x[e] = fmaf(pf_sigm(logits[(size_t) t * (NEXP + 1) + NEXP]), part[((size_t) C * TOPK + t) * N + i], s);
     }
 }
@@ -657,7 +812,7 @@ void Engine::prefill_alloc() {
         p->bo_f = palloc<float>((size_t) pf_c_ * N);
         p->inj_a = palloc<float>((size_t) pf_c_ * HC);
         p->inj_f = palloc<float>((size_t) pf_c_ * HC);
-        p->moe_q8 = env_flag("FNX_PF_MOE_Q8");
+        p->moe_q8 = env_int("FNX_PF_MOE_Q8", 0) != 0;
         if (p->moe_q8) {
             p->xq = palloc<uint8_t>((size_t) pf_c_ * q8_1_bytes(N));
             q8_twin(p->xq, (size_t) pf_c_ * q8_1_bytes(N), palloc<int8_t>((size_t) pf_c_ * N), palloc<float>((size_t) pf_c_ * N / 32));
@@ -741,8 +896,8 @@ void Engine::prefill_alloc() {
                     }
             }
         }
-        if (w.ec.n_slots) {   // the stages themselves: prefill_stages, once the experts' places are final
-            const long long stage_rows = env_int("FNX_PF_STAGE_ROWS", 2048);
+        if (w.ec.n_slots || m_.cpu_experts) {   // the stages themselves: prefill_stages, once the experts' places are final
+            const long long stage_rows = env_int("FNX_PF_STAGE_ROWS", m_.cpu_experts ? 256 : 2048);
             if (stage_rows < 0 || stage_rows > INT32_MAX)
                 throw std::runtime_error("FNX_PF_STAGE_ROWS: want tokens >= 0, got " + std::to_string(stage_rows));
             p->stage_rows = (int) stage_rows;
@@ -752,8 +907,10 @@ void Engine::prefill_alloc() {
             own_pinned(p->ep_hgu);
             ckc(cudaMallocHost(&p->ep_hdn, (size_t) NL * NEXP * sizeof(char*)), "pinned tables");
             own_pinned(p->ep_hdn);
-            ckc(cudaMallocHost(&p->slot_h, (size_t) NL * NEXP * sizeof(int)), "pinned slots");
-            own_pinned(p->slot_h);
+            if (w.ec.n_slots) {
+                ckc(cudaMallocHost(&p->slot_h, (size_t) NL * NEXP * sizeof(int)), "pinned slots");
+                own_pinned(p->slot_h);
+            }
             ckc(cudaStreamCreateWithFlags(&p->cs, cudaStreamNonBlocking), "copy stream");
             own_stream(p->cs);
             for (int k = 0; k < 2; ++k)
@@ -799,15 +956,26 @@ void Engine::prefill_alloc() {
 
 size_t Engine::pf_stage_bytes(int c) const {
     const CardW& w = m_.cards[c];
-    if (!w.ec.n_slots) return 0;
+    if (!w.ec.n_slots && !m_.cpu_experts) return 0;
     // a stage holds the largest layer's experts not in a slot at the start, FNX_PF_STAGE_MIB at most
     size_t most = 0;
-    for (int l = 0; l < NL; ++l) {
-        size_t n = 0;
-        for (int e = 0; e < NEXP; ++e) n += m_.resident[(size_t) l][(size_t) e] ? 0 : 1;
-        most = std::max(most, n * (w.L[(size_t) l].gu_e_stride + w.L[(size_t) l].down_e_stride));
+    if (m_.cpu_experts) {
+        for (int l = 0; l < NL; ++l) {
+            size_t bytes = 0;
+            for (int e = 0; e < NEXP; ++e) {
+                const ColdExpertInfo& ci = m_.cold_experts[(size_t) l * NEXP + e];
+                if (ci.is_cold) bytes += ci.gu_half_bytes + ci.dn_half_bytes;
+            }
+            most = std::max(most, bytes);
+        }
+    } else {
+        for (int l = 0; l < NL; ++l) {
+            size_t n = 0;
+            for (int e = 0; e < NEXP; ++e) n += m_.resident[(size_t) l][(size_t) e] ? 0 : 1;
+            most = std::max(most, n * (w.L[(size_t) l].gu_e_stride + w.L[(size_t) l].down_e_stride));
+        }
     }
-    const long long stage_mib = env_int("FNX_PF_STAGE_MIB", 384);
+    const long long stage_mib = env_int("FNX_PF_STAGE_MIB", m_.cpu_experts ? 128 : 384);
     if (stage_mib < 0) throw std::runtime_error("FNX_PF_STAGE_MIB: want MiB >= 0, got " + std::to_string(stage_mib));
     return std::min(most, (size_t) stage_mib << 20);
 }
@@ -815,7 +983,15 @@ size_t Engine::pf_stage_bytes(int c) const {
 void Engine::prefill_stages() {
     for (int c = 0; c < NCARD; ++c) {
         Pf& p = *pf_[c];
+        const CardW& w = m_.cards[c];
         if (p.stage[0]) throw std::runtime_error("prefill_stages: card " + std::to_string(c) + " has its stages already");
+        if (m_.cpu_experts && p.res_gu.empty()) {
+            ckc(cudaSetDevice(p.dev), "set");
+            p.res_gu.resize((size_t) NL * NEXP, nullptr);
+            p.res_dn.resize((size_t) NL * NEXP, nullptr);
+            ckc(cudaMemcpy(p.res_gu.data(), w.ec.ep_gu, (size_t) NL * NEXP * sizeof(char*), cudaMemcpyDeviceToHost), "cpu_experts ep_gu");
+            ckc(cudaMemcpy(p.res_dn.data(), w.ec.ep_dn, (size_t) NL * NEXP * sizeof(char*), cudaMemcpyDeviceToHost), "cpu_experts ep_dn");
+        }
         p.stage_bytes = pf_stage_bytes(c);
         if (!p.stage_bytes) continue;
         ckc(cudaSetDevice(p.dev), "set");
@@ -848,7 +1024,7 @@ void Engine::prefill_draft(int C, int set) {
         rms_norm_rows(p.R, mc.norm_hid, p.xf, C, D, eps, s);
         pf_dense(p, mc.fc_hid.s, N, N, p.xf, HC * C, p.up32, N, s);
         add_streams(p.up32, p.bo_f, p.R, C, s);
-        pf_hc_read(p, p.R, nullptr, nullptr, L.hc_norm[0], L.hc_down[0], L.hc_up[0], nullptr, eps, p.mixed, nullptr, C, s);
+        pf_hc_read(p, p.R, nullptr, nullptr, L.hc_norm[0], L.hc_down[0], L.hc_up[0], Q8S{}, eps, p.mixed, nullptr, C, s);
         if (L.idx_wq) {
             k_bf16_f32<<<grid_for((size_t) 512 * N), 256, 0, s>>>(L.idx_wq, (size_t) 512 * N, p.widx);
             k_bf16_f32<<<grid_for((size_t) 128 * N), 256, 0, s>>>(L.idx_wk, (size_t) 128 * N, p.widx + (size_t) 512 * N);
@@ -967,9 +1143,60 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
         for (Pf* p : pf_) p->R = p->Rk[j], p->bo_f = p->bofk[j], p->inj_f = p->injfk[j], p->ctl = p->ctlk[j], p->bo_a = p->boak[j],
                           p->inj_a = p->injak[j];
     };
-    // with an ExpertCache: the pass's expert tables, each layer's experts not in a slot at stage[l & 1] (as many as
-    // fit, in expert order; the rest in place), the others in their slots
-    if (staging)
+    // with FNX_CPU_EXPERTS=1: build the pass's static resident VRAM + cold expert tables (staged into stage[l & 1] or
+    // in-place UVA pointers from Model::cold_experts) once per staging mode; with ExpertCache: rebuild from live slots
+    if (m_.cpu_experts) {
+        const int want_mode = staging ? 2 : 1;
+        each([&](int c, CardBuf& b, const CardW& w, Pf& p) {
+            if (c >= 2) throw std::runtime_error("prefill: FNX_CPU_EXPERTS=1 requires NCARD == 2");
+            if (p.cpu_table_mode == want_mode) return;
+            const int ch = c & 1;
+            p.staged = p.in_place = 0;
+            for (int l = 0; l < NL; ++l) {
+                const size_t gs = w.L[(size_t) l].gu_e_stride, ds = w.L[(size_t) l].down_e_stride;
+                int n_ram = 0;
+                for (int e = 0; e < NEXP; ++e) n_ram += m_.cold_experts[(size_t) l * NEXP + e].is_cold ? 1 : 0;
+                const int fit = staging ? std::min(n_ram, (int) (p.stage_bytes / (gs + ds))) : 0;
+                char* gu_at = staging ? p.stage[l & 1] : nullptr;
+                char* dn_at = staging ? gu_at + (size_t) fit * gs : nullptr;
+                std::vector<Pf::Copy>& cp = p.copies[l];
+                cp.clear();
+                auto add = [&](const char* src, char* dst, size_t n) {
+                    if (!cp.empty() && cp.back().src + cp.back().n == src && cp.back().dst + cp.back().n == dst) cp.back().n += n;
+                    else cp.push_back({src, dst, n});
+                };
+                int k = 0;
+                for (int e = 0; e < NEXP; ++e) {
+                    const size_t i = (size_t) l * NEXP + e;
+                    const ColdExpertInfo& ci = m_.cold_experts[i];
+                    if (!ci.is_cold) {
+                        p.ep_hgu[i] = p.res_gu[i];
+                        p.ep_hdn[i] = p.res_dn[i];
+                    } else {
+                        if (ci.gu_half_bytes != gs || ci.dn_half_bytes != ds)
+                            throw std::runtime_error("prefill: cold expert half bytes mismatch layer stride");
+                        const char* hgu = reinterpret_cast<const char*>(ci.gu_half[ch]);
+                        const char* hdn = reinterpret_cast<const char*>(ci.dn_half[ch]);
+                        if (k < fit) {
+                            p.ep_hgu[i] = gu_at + (size_t) k * gs;
+                            p.ep_hdn[i] = dn_at + (size_t) k * ds;
+                            add(hgu, gu_at + (size_t) k * gs, gs);
+                            add(hdn, dn_at + (size_t) k * ds, ds);
+                            ++k;
+                            p.staged += gs + ds;
+                        } else {
+                            p.ep_hgu[i] = hgu;
+                            p.ep_hdn[i] = hdn;
+                            p.in_place += gs + ds;
+                        }
+                    }
+                }
+            }
+            ckc(cudaMemcpyAsync(p.ep_gu, p.ep_hgu, (size_t) NL * NEXP * sizeof(char*), cudaMemcpyHostToDevice, b.st), "tables");
+            ckc(cudaMemcpyAsync(p.ep_dn, p.ep_hdn, (size_t) NL * NEXP * sizeof(char*), cudaMemcpyHostToDevice, b.st), "tables");
+            p.cpu_table_mode = want_mode;
+        });
+    } else if (staging)
         each([&](int, CardBuf& b, const CardW& w, Pf& p) {
             const ExpertCache& ec = w.ec;
             ckc(cudaMemcpyAsync(p.slot_h, ec.slot_of, (size_t) NL * NEXP * sizeof(int), cudaMemcpyDeviceToHost, b.st), "slots");
@@ -1148,9 +1375,9 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 cudaStream_t s = b.st;
                 const int P = C * TOPK, ffs = w.ff1 - w.ff0;
                 DW gu_e = L.gu_e, down_e = L.down_e;
-                if (staging) {
+                if (staging || m_.cpu_experts) {
                     gu_e.ep = p.ep_gu + (size_t) l * NEXP, down_e.ep = p.ep_dn + (size_t) l * NEXP;
-                    if (j == 0) ckc(cudaStreamWaitEvent(s, p.ev_ready[l & 1], 0), "stage in");
+                    if (staging && j == 0) ckc(cudaStreamWaitEvent(s, p.ev_ready[l & 1], 0), "stage in");
                 }
                 pf_hc_read(p, p.R, p.bo_a, p.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], eps, p.mixed, p.inj_f, C, s);
                 if (p.moe_q8) quantize_q8_1(p.mixed, p.xq, N, C, s);   // else xh holds the hc read's f16 of mixed
@@ -1173,8 +1400,12 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 // the shared expert: rows P + t of part
                 pf_dense_xh(p, L.sh_gu.s, 2 * ffs, N, C, p.shg, 2 * ffs, s);   // xh: still the f16 of mixed
                 k_pf_swiglu<<<grid_for((size_t) C * ffs), 256, 0, s>>>(p.shg, ffs, C, p.shh);
-                k_q8s_f16<<<grid_for((size_t) N * ffs), 256, 0, s>>>(L.sh_down.s.q, L.sh_down.s.d, (size_t) N * ffs, p.wh);
-                pf_gemm(p, p.wh, N, ffs, p.shh, C, p.part + (size_t) P * N, N, s);
+                if (use_pf_dp4a()) {
+                    pf_q8s_dp4a(p, L.sh_down.s, N, ffs, p.shh, C, p.part + (size_t) P * N, N, s);
+                } else {
+                    k_q8s_f16<<<grid_for((size_t) N * ffs), 256, 0, s>>>(L.sh_down.s.q, L.sh_down.s.d, (size_t) N * ffs, p.wh);
+                    pf_gemm(p, p.wh, N, ffs, p.shh, C, p.part + (size_t) P * N, N, s);
+                }
                 ckc(cudaGetLastError(), "ffn");
             });
             each([&](int c, CardBuf& b, const CardW&, Pf& p) {
@@ -1253,7 +1484,7 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                      std::chrono::duration<double, std::milli>(t_up - t_pass).count(),
                      std::chrono::duration<double, std::milli>(t_enq - t_pass).count(),
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_main).count());
-        if (staging)
+        if (staging || m_.cpu_experts)
             for (int c = 0; c < NCARD; ++c)
                 std::fprintf(stderr, "; card %d experts %zu MiB copied in, %zu MiB read in place", c, pf_[c]->staged >> 20, pf_[c]->in_place >> 20);
         std::fprintf(stderr, "\n");

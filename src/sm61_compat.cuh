@@ -44,3 +44,14 @@ __device__ __forceinline__ unsigned fnx_match_any(unsigned mask, unsigned v) {
     return mine;
 #endif
 }
+
+// System-scope acquire load of a 32-bit flag written by the host (pinned UVA memory, src/engine.cu).
+__device__ __forceinline__ unsigned fnx_ld_acquire_sys_u32(const volatile unsigned* flag) {
+    unsigned f;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(f) : "l"(flag) : "memory");
+#else
+    asm volatile("ld.global.cv.u32 %0, [%1];\n\tmembar.sys;" : "=r"(f) : "l"(flag) : "memory");
+#endif
+    return f;
+}

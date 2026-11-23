@@ -158,9 +158,11 @@ int main() {
             cudaMemset(wd.d, 0, (size_t) LR * D / 32 * 2);
             cudaMemset(wu.q, 1, (size_t) LR * D);
             cudaMemset(wu.d, 0, (size_t) LR * D / 32 * 2);
-            uint16_t* wi;
-            cudaMalloc(&wi, (size_t) HC * D * 2);
-            cudaMemset(wi, 0, (size_t) HC * D * 2);
+            Q8S wi;
+            cudaMalloc(&wi.q, (size_t) HC * D);
+            cudaMalloc(&wi.d, (size_t) HC * D / 32 * 2);
+            cudaMemset(wi.q, 0, (size_t) HC * D);
+            cudaMemset(wi.d, 0, (size_t) HC * D / 32 * 2);
             float *mixed, *injo, *scratch;
             cudaMalloc(&mixed, (size_t) MAXT * N * 4);
             cudaMalloc(&injo, MAXT * HC * 4);
@@ -172,7 +174,7 @@ int main() {
             cudaMemset(herr, 0, 4);
             void* q8;
             cudaMalloc(&q8, (size_t) MAXT * q8_1_bytes(N));
-            const double mb = (2.0 * LR * D * (1 + 2.0 / 32) + HC * D * 2) / 1e6;
+            const double mb = (2.0 * LR * D + HC * D) * (1 + 2.0 / 32) / 1e6;
             const float us = time_us([&](cudaStream_t s) {
                 hc_read(R, bo, inj, wn, wd, wu, wi, 1e-6f, mixed, injo, scratch, herr, T, s, q8);
             });

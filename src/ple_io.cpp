@@ -23,6 +23,7 @@ namespace {
 
 constexpr uint64_t PAGE = 4096;
 constexpr size_t SLAB_UNITS = 4096;   // reads in flight per round: 32 MiB of slab at two pages a unit
+constexpr long long DEFAULT_NGRAM_CACHE_MIB = 1024;
 
 uint64_t now_ns() {
     return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -58,7 +59,7 @@ PleRows::Mode PleRows::mode_from_env() {
     else if (!std::strcmp(s, "disk")) m = Mode::DISK;
     else throw std::runtime_error(std::string("FNX_NGRAM: '") + s + "', not ram or disk");
     // the disk's settings are checked whatever the mode: one set beside FNX_NGRAM=ram would change nothing, silently
-    env_in("FNX_NGRAM_CACHE_MIB", 256, 0, 1 << 20);
+    env_in("FNX_NGRAM_CACHE_MIB", DEFAULT_NGRAM_CACHE_MIB, 0, 1 << 20);
     env_in("FNX_NGRAM_THREADS", 32, 1, 256);
     for (const char* v : {"FNX_NGRAM_CACHE_MIB", "FNX_NGRAM_THREADS"})
         if (m == Mode::RAM && std::getenv(v)) throw std::runtime_error(std::string(v) + " is set, and only FNX_NGRAM=disk reads it");
@@ -90,7 +91,7 @@ PleRows::PleRows(const Gguf& g, const Tensor& t, Mode mode) : mode_(mode), t_(t)
         throw std::runtime_error("n-gram table: " + path_ + " is on a rotational disk, too slow for FNX_NGRAM=disk (a random read per row): "
                                  "move the model to an SSD or use FNX_NGRAM=ram");
     }
-    const uint64_t cache_mib = env_in("FNX_NGRAM_CACHE_MIB", 256, 0, 1 << 20);
+    const uint64_t cache_mib = env_in("FNX_NGRAM_CACHE_MIB", DEFAULT_NGRAM_CACHE_MIB, 0, 1 << 20);
     threads_ = (int) env_in("FNX_NGRAM_THREADS", 32, 1, 256);
     sets_ = (cache_mib << 20) / rb_ / WAYS;
     try {

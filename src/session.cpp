@@ -417,6 +417,9 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     constexpr double ROUND_MS = 43.3, DRAFT_ROW_MS = 2.15, DRAFT_CALL_MS = 1.35, DECAY = 0.97;
 #elif FNX_27B
     constexpr double ROUND_MS = 16.5, DRAFT_ROW_MS = 1.24, DRAFT_CALL_MS = 0.65, DECAY = 0.97;
+#elif defined(FNX_ARCH) && FNX_ARCH < 70
+    // Dual Quadro P6000 (sm_61) + Ivy Bridge CPU cold experts: amortize round latency over batched speculative windows
+    constexpr double ROUND_MS = 28.0, DRAFT_ROW_MS = 2.5, DRAFT_CALL_MS = 1.5, DECAY = 0.97;
 #else
     constexpr double ROUND_MS = 11.2, DRAFT_ROW_MS = 1.3, DRAFT_CALL_MS = 0.65, DECAY = 0.97;
 #endif
@@ -595,6 +598,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     prompt_.clear();
     timing_ = nullptr;
     st.decode_ms = ms_since(t0);
+    if (env_flag("FNX_PF_TIMING") || env_flag("FNX_STATS")) e_.log_cpu_pool_stats("session");
     return fin;
 }
 

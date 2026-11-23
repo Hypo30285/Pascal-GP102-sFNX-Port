@@ -93,4 +93,21 @@ struct RowSegs {
 
 RowSegs row_segs(const std::vector<int>& counts);
 
+// Allocates 6+2 LM-head workspace on the active CUDA device, reusing shared_ub as work.ub.
+inline void init_vhead_work(VHeadWork& w, int max_rows, int max_in, float* shared_ub) {
+    w.max_rows = max_rows;
+    w.max_in = max_in;
+    w.xq = dalloc<int8_t>((size_t) MAXT * max_in);
+    w.xd = dalloc<float>((size_t) MAXT * (max_in / 32));
+    w.xd_half = dalloc<float>((size_t) MAXT * (max_in / 32));
+    w.sx253 = dalloc<int32_t>((size_t) MAXT * (max_in / 16));
+    w.act_meta = dalloc<float2>(MAXT);
+    w.lb = dalloc<float>((size_t) MAXT * max_rows);
+    w.ub = shared_ub;
+    w.cta_max = dalloc<float>(vhead_cta_max_floats(max_rows, MAXT));
+    w.lcut = dalloc<float>(MAXT);
+    w.cand_idx = dalloc<int32_t>((size_t) MAXT * max_rows);
+    w.cand_cnt = dalloc<uint32_t>(MAXT);
+}
+
 }  // namespace fnx

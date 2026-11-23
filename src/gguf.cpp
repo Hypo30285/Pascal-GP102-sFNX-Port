@@ -1,5 +1,6 @@
 #include "gguf.hpp"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -12,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <regex>
+#include <set>
 #include <stdexcept>
 
 namespace fnx {
@@ -88,38 +90,213 @@ int64_t read_int(Cur& c, uint32_t t) {
 }
 }  // namespace
 
-Gguf::Gguf(const std::string& first) {
+namespace {
+bool is_q4q6q8_full_layer(int l) {
+    return l == 0 || l == 1 || l == 2 || l == 4 || l == 30 || l == 46 || l == 47;
+}
+
+bool same_shape(const Tensor& a, const Tensor& b) {
+    if (a.n_dims != b.n_dims) return false;
+    for (int d = 0; d < 4; ++d)
+        if (a.ne[d] != b.ne[d]) return false;
+    return true;
+}
+
+std::string shape_str(const Tensor& t) {
+    std::string s = "[";
+    for (int d = 0; d < t.n_dims; ++d) s += (d ? ", " : "") + std::to_string(t.ne[d]);
+    return s + "]";
+}
+}  // namespace
+
+Gguf::Gguf(const std::string& first, bool apply_env) {
+    GgufOpts opts;
+    if (apply_env) {
+        if (const char* e = std::getenv("FNX_ENGRAM_GGUF"); e && *e) opts.engram_gguf = e;
+        if (const char* h = std::getenv("FNX_HYBRID_Q6_GGUF"); h && *h) opts.hybrid_q6_gguf = h;
+        if (const char* hm = std::getenv("FNX_HYBRID_MAP"); hm && *hm) opts.hybrid_map = hm;
+    }
+    try {
+        init(first, opts);
+    } catch (...) {
+        close_maps();
+        throw;
+    }
+}
+
+Gguf::Gguf(const std::string& first, const GgufOpts& opts) {
+    try {
+        init(first, opts);
+    } catch (...) {
+        close_maps();
+        throw;
+    }
+}
+
+void Gguf::close_maps() {
+    for (Map& mp : maps_) {
+        if (mp.base && mp.base != MAP_FAILED) munmap(mp.base, mp.size);
+        if (mp.fd >= 0) close(mp.fd);
+    }
+    maps_.clear();
+}
+
+Gguf::~Gguf() { close_maps(); }
+
+void Gguf::init(const std::string& first, const GgufOpts& opts) {
+    const bool has_engram = !opts.engram_gguf.empty();
     std::smatch m;
     static const std::regex split(R"((.*-)(\d{5})(-of-)(\d{5})(\.gguf)$)");
     if (std::regex_match(first, m, split)) {
         const int n = std::stoi(m[4]);
         for (int i = 1; i <= n; ++i) {
-            char num[8];
+            char num[16];
             std::snprintf(num, sizeof num, "%05d", i);
-            load_shard(m[1].str() + num + m[3].str() + m[4].str() + m[5].str(), i == 1);
+            const std::string sp = m[1].str() + num + m[3].str() + m[4].str() + m[5].str();
+            if (has_engram && n > 1 && i == n && access(sp.c_str(), F_OK) != 0 && errno == ENOENT) {
+                std::fprintf(stderr, "gguf: skipping missing final split shard %s (FNX_ENGRAM_GGUF set)\n", sp.c_str());
+                continue;
+            }
+            load_shard(sp, i == 1);
         }
     } else {
         load_shard(first, true);
     }
-}
 
-Gguf::~Gguf() {
-    for (Map& mp : maps_) {
-        if (mp.base) munmap(mp.base, mp.size);
-        if (mp.fd >= 0) close(mp.fd);
+    if (has_engram) {
+        std::map<std::string, Tensor> ext;
+        load_shard(opts.engram_gguf, false, &ext);
+        const auto it = ext.find("per_layer_token_embd.weight");
+        if (it == ext.end())
+            throw std::runtime_error("gguf: FNX_ENGRAM_GGUF " + opts.engram_gguf + " does not contain per_layer_token_embd.weight");
+        const Tensor& et = it->second;
+        if (et.n_dims != 2 || et.ne[0] <= 0 || et.ne[1] <= 0)
+            throw std::runtime_error("gguf: FNX_ENGRAM_GGUF per_layer_token_embd.weight has invalid shape " + shape_str(et));
+        if (const Tensor* prev = find("per_layer_token_embd.weight")) {
+            if (!same_shape(*prev, et))
+                throw std::runtime_error("gguf: FNX_ENGRAM_GGUF per_layer_token_embd.weight shape " + shape_str(et) +
+                                         " does not match base " + shape_str(*prev));
+        }
+        tensors_["per_layer_token_embd.weight"] = et;
+        engram_override_ = true;
+        engram_path_ = opts.engram_gguf;
+        std::fprintf(stderr, "gguf: FNX_ENGRAM_GGUF loaded per_layer_token_embd.weight (type=%u, ne=%lldx%lld, %.2f GiB) from %s\n",
+                     et.type, (long long) et.ne[0], (long long) et.ne[1], et.nbytes / (double) (1ull << 30), opts.engram_gguf.c_str());
+    }
+
+    if (!opts.hybrid_q6_gguf.empty()) {
+        const std::string hmap = opts.hybrid_map.empty() ? "q4q6q8" : opts.hybrid_map;
+        if (hmap != "q4q6q8")
+            throw std::runtime_error("gguf: unsupported FNX_HYBRID_MAP '" + hmap + "' (expected q4q6q8)");
+        std::map<std::string, Tensor> ext;
+        load_shard_set(opts.hybrid_q6_gguf, /*allow_missing=*/true, ext);
+        // Discover all routed-expert layers present in the base model
+        std::set<int> layers;
+        for (const auto& kv : tensors_) {
+            int l = -1, nch = 0;
+            if (std::sscanf(kv.first.c_str(), "blk.%d.ffn_down_exps.weight%n", &l, &nch) == 1 &&
+                nch == (int) kv.first.size() && l >= 0)
+                layers.insert(l);
+        }
+        if (layers.empty())
+            throw std::runtime_error("gguf: FNX_HYBRID_Q6_GGUF set, but base model has no blk.<l>.ffn_down_exps.weight tensors");
+        auto splice_one = [&](const std::string& name) {
+            const auto bi = tensors_.find(name);
+            if (bi == tensors_.end())
+                throw std::runtime_error("gguf: hybrid splice base model missing tensor " + name);
+            const auto si = ext.find(name);
+            if (si == ext.end())
+                throw std::runtime_error("gguf: FNX_HYBRID_Q6_GGUF " + opts.hybrid_q6_gguf + " missing tensor " + name);
+            if (!same_shape(bi->second, si->second))
+                throw std::runtime_error("gguf: hybrid splice tensor " + name + " shape " + shape_str(si->second) +
+                                         " does not match base " + shape_str(bi->second));
+            bi->second = si->second;
+        };
+        int n_full = 0, n_down_only = 0;
+        uint64_t total_expert_bytes = 0;
+        int64_t total_experts = 0;
+        for (int l : layers) {
+            const std::string b = "blk." + std::to_string(l) + ".";
+            if (is_q4q6q8_full_layer(l)) {
+                splice_one(b + "ffn_gate_exps.weight");
+                splice_one(b + "ffn_up_exps.weight");
+                splice_one(b + "ffn_down_exps.weight");
+                ++n_full;
+            } else {
+                splice_one(b + "ffn_down_exps.weight");
+                ++n_down_only;
+            }
+            const Tensor& gt = t(b + "ffn_gate_exps.weight");
+            const Tensor& ut = t(b + "ffn_up_exps.weight");
+            const Tensor& dt = t(b + "ffn_down_exps.weight");
+            total_expert_bytes += (uint64_t) gt.nbytes + ut.nbytes + dt.nbytes;
+            total_experts += dt.ne[2];
+        }
+        hybrid_splice_ = true;
+        hybrid_map_ = hmap;
+        hybrid_q6_path_ = opts.hybrid_q6_gguf;
+        std::fprintf(stderr,
+                     "gguf: FNX_HYBRID_Q6_GGUF (%s): spliced %zu layers (%d full gate/up/down, %d down-only), "
+                     "%lld experts = %llu B (%.4f GiB) from %s\n",
+                     hmap.c_str(), layers.size(), n_full, n_down_only, (long long) total_experts,
+                     (unsigned long long) total_expert_bytes, total_expert_bytes / (double) (1ull << 30),
+                     opts.hybrid_q6_gguf.c_str());
     }
 }
 
-void Gguf::load_shard(const std::string& path, bool meta) {
+void Gguf::load_shard_set(const std::string& path, bool allow_missing, std::map<std::string, Tensor>& dst) {
+    struct stat st{};
+    if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+        DIR* dir = opendir(path.c_str());
+        if (!dir) throw std::runtime_error("gguf: cannot open directory " + path);
+        std::vector<std::string> files;
+        for (dirent* de = readdir(dir); de; de = readdir(dir)) {
+            const std::string name = de->d_name;
+            if (name.size() <= 5 || name.compare(name.size() - 5, 5, ".gguf") != 0) continue;
+            if (name.compare(0, 6, "mmproj") == 0 || name.compare(0, 3, "mtp") == 0) continue;
+            files.push_back(path + (path.back() == '/' ? "" : "/") + name);
+        }
+        closedir(dir);
+        std::sort(files.begin(), files.end());
+        if (files.empty()) throw std::runtime_error("gguf: no .gguf shards found in directory " + path);
+        for (const std::string& f : files) load_shard(f, false, &dst);
+        return;
+    }
+    std::smatch m;
+    static const std::regex split(R"((.*-)(\d{5})(-of-)(\d{5})(\.gguf)$)");
+    if (std::regex_match(path, m, split)) {
+        const int n = std::stoi(m[4]);
+        int loaded = 0;
+        for (int i = 1; i <= n; ++i) {
+            char num[16];
+            std::snprintf(num, sizeof num, "%05d", i);
+            const std::string sp = m[1].str() + num + m[3].str() + m[4].str() + m[5].str();
+            if (allow_missing && access(sp.c_str(), F_OK) != 0 && errno == ENOENT) continue;
+            load_shard(sp, false, &dst);
+            ++loaded;
+        }
+        if (loaded == 0) throw std::runtime_error("gguf: cannot open any shard of " + path);
+    } else {
+        load_shard(path, false, &dst);
+    }
+}
+
+void Gguf::load_shard(const std::string& path, bool meta, std::map<std::string, Tensor>* dst) {
     Map mp;
     mp.path = path;
     mp.fd = open(path.c_str(), O_RDONLY);
     if (mp.fd < 0) throw std::runtime_error("gguf: cannot open " + path);
     struct stat st;
-    fstat(mp.fd, &st);
+    if (fstat(mp.fd, &st) != 0) {
+        close(mp.fd);
+        throw std::runtime_error("gguf: cannot stat " + path);
+    }
     mp.size = (size_t) st.st_size;
     mp.base = mmap(nullptr, mp.size, PROT_READ, MAP_SHARED, mp.fd, 0);
-    if (mp.base == MAP_FAILED) throw std::runtime_error("gguf: mmap failed for " + path);
+    if (mp.base == MAP_FAILED) {
+        close(mp.fd);
+        throw std::runtime_error("gguf: mmap failed for " + path);
+    }
     maps_.push_back(mp);
     Cur c{(const uint8_t*) mp.base, (const uint8_t*) mp.base + mp.size};
     if (c.get<uint32_t>() != 0x46554747u) throw std::runtime_error("gguf: bad magic in " + path);
@@ -193,6 +370,7 @@ void Gguf::load_shard(const std::string& path, bool meta) {
         ts.push_back(t);
     }
     const uint64_t data0 = ((uint64_t) (c.p - (const uint8_t*) mp.base) + align - 1) / align * align;
+    std::map<std::string, Tensor>& target = dst ? *dst : tensors_;
     for (size_t i = 0; i < ts.size(); ++i) {
         Tensor& t = ts[i];
         const TypeInfo ti = type_info(t.type);
@@ -209,7 +387,7 @@ void Gguf::load_shard(const std::string& path, bool meta) {
         t.data = (const uint8_t*) mp.base + data0 + offs[i];
         t.shard = (int) maps_.size() - 1;
         t.offset = data0 + offs[i];
-        tensors_[t.name] = t;
+        target[t.name] = t;
     }
 }
 

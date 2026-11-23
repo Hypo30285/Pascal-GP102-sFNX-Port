@@ -1,10 +1,13 @@
 # build outputs
 bin/
 build/
+*.o
+*.d
 __pycache__/
 .venv
 *.so
 *.log
+logs/
 
 # llama.cpp at a37cc46: a checkout (or link) here, see Makefile
 llama.cpp

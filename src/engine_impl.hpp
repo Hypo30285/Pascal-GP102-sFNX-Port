@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "kernels.hpp"
+#include "kq_avx1.hpp"
 #include "model.hpp"
 #include "owned.hpp"
 
@@ -42,10 +43,13 @@ struct CardBuf {
     int *topi, *njobs;
     Job *jobs_gu, *jobs_dn, *dense[MAXT + 1];
     float *gu, *part;
+    float* cold_out = nullptr;        // FNX_CPU_EXPERTS=1, card 0 only: [MAXT * N] CPU cold-expert weighted sum
     float* sh_gu;                     // the shared expert: [T][gate | up]
     void* sh_hq;                      // its h as q8_1
     float *ple_emb, *ple_key, *ple_val;
+    void* head_xq = nullptr;
     float* head_logits;
+    VHeadWork vh_work{};
     int *tk_pen_tok = nullptr, *tk_pen_cnt = nullptr, *tk_pen_n = nullptr, *tk_i = nullptr;   // top_tokens()
     float* tk_v = nullptr;
     unsigned* tk_err = nullptr;
@@ -162,6 +166,7 @@ inline const char* window_error(unsigned err, bool draft) {
         return m.c_str();
     }
     if (err & 64u) return "the host's n-gram rows failed after the window started (FNX_NGRAM=disk)";
+    if (err & POLY_WC_ERR_BIT) return "PolyWcBridge CPU cold-expert timeout";
     if (err) return "an error bit no message names";
     return nullptr;
 }

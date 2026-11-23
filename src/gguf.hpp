@@ -43,10 +43,19 @@ struct Tensor {
     int64_t nrows() const { return ne[1] * ne[2] * ne[3]; }
 };
 
+struct GgufOpts {
+    std::string engram_gguf;     // FNX_ENGRAM_GGUF: external shard supplying per_layer_token_embd.weight
+    std::string hybrid_q6_gguf;  // FNX_HYBRID_Q6_GGUF: splice source for blk.<l>.ffn_{gate,up,down}_exps.weight
+    std::string hybrid_map;      // FNX_HYBRID_MAP: "q4q6q8" (default when hybrid_q6_gguf is set)
+};
+
 class Gguf {
 public:
-    explicit Gguf(const std::string& first_shard);   // finds the other "-0000N-of-0000M" shards beside it
+    explicit Gguf(const std::string& first_shard, bool apply_env = true);   // finds the other "-0000N-of-0000M" shards beside it
+    Gguf(const std::string& first_shard, const GgufOpts& opts);
     ~Gguf();
+    Gguf(const Gguf&) = delete;
+    Gguf& operator=(const Gguf&) = delete;
     const Tensor& t(const std::string& name) const;          // throws when missing
     const Tensor* find(const std::string& name) const;
     // metadata of the first shard: integers, floats, strings, and integer arrays
@@ -67,6 +76,11 @@ public:
     const std::string& shard_path(int s) const { return maps_[(size_t) s].path; }
     size_t shard_size(int s) const { return maps_[(size_t) s].size; }
     const uint8_t* shard_base(int s) const { return (const uint8_t*) maps_[(size_t) s].base; }
+    bool has_engram_override() const { return engram_override_; }
+    bool has_hybrid_splice() const { return hybrid_splice_; }
+    const std::string& hybrid_map() const { return hybrid_map_; }
+    const std::string& engram_path() const { return engram_path_; }
+    const std::string& hybrid_q6_path() const { return hybrid_q6_path_; }
 
 private:
     struct Map { void* base = nullptr; size_t size = 0; int fd = -1; std::string path; };
@@ -80,7 +94,15 @@ private:
     std::map<std::string, std::vector<std::string>> str_arrays_;
 #endif
     std::set<std::string> keys_;
-    void load_shard(const std::string& path, bool meta);
+    bool engram_override_ = false;
+    bool hybrid_splice_ = false;
+    std::string hybrid_map_;
+    std::string engram_path_;
+    std::string hybrid_q6_path_;
+    void init(const std::string& first_shard, const GgufOpts& opts);
+    void close_maps();
+    void load_shard(const std::string& path, bool meta, std::map<std::string, Tensor>* dst = nullptr);
+    void load_shard_set(const std::string& path, bool allow_missing, std::map<std::string, Tensor>& dst);
 };
 
 // Reads groups of tensors (a layer's, say) into host buffers ahead of the threads that slice them, in the order they

@@ -57,10 +57,14 @@ __global__ void k_add_norm(float* R, const float* pend, const float* w, float* y
         if (lane == 0) td[qr * (N / 32) + bl] = __half2float(__float2half(d));
     }
 }
+void add_norm_to(cudaStream_t st, float* R, const float* pend, const float* w, float* y, int8_t* tq, float* td, int T,
+                 float eps, bool last_only = false) {
+    k_add_norm<<<T, 1024, 0, st>>>(R, pend, w, y, tq, td, eps, last_only);
+    ck(cudaGetLastError(), "add_norm");
+}
 void add_norm(CardBuf& b, float* R, const float* pend, const float* w, float* y, int T, float eps, bool twin,
               bool last_only = false) {
-    k_add_norm<<<T, 1024, 0, b.st>>>(R, pend, w, y, twin ? b.xtq : nullptr, twin ? b.xtd : nullptr, eps, last_only);
-    ck(cudaGetLastError(), "add_norm");
+    add_norm_to(b.st, R, pend, w, y, twin ? b.xtq : nullptr, twin ? b.xtd : nullptr, T, eps, last_only);
 }
 // [rms(e[t]) * we | rms(h[t]) * wh] quantized directly into the split twin (tq, td) of a q8_1 buffer of 2N-wide rows:
 // the draft layer's input before its projection
@@ -217,6 +221,14 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->apart = dalloc<float>((size_t) MAXT * S27_NQ * S27_ASPLIT * (HD + 2));
         b->gu = dalloc<float>((size_t) MAXT * 2 * ffs);
         b->head_logits = dalloc<float>((size_t) MAXT * (w.v1 - w.v0));
+        if (w.out_6p2.hi) {
+            b->head_xq = dalloc<uint8_t>((size_t) MAXT * q8_1_bytes(N));
+            b->head_xtq = dalloc<int8_t>((size_t) MAXT * N);
+            b->head_xtd = dalloc<float>((size_t) MAXT * N / 32);
+            q8_twin(b->head_xq, (size_t) MAXT * q8_1_bytes(N), b->head_xtq, b->head_xtd);
+            own([q = (const void*) b->head_xq] { q8_untwin(q); });
+            init_vhead_work(b->vh_work, w.v1 - w.v0, N, b->head_logits);
+        }
         b->best_v = dalloc<float>(MAXT);
         b->best_i = dalloc<int>(MAXT);
         b->am_keys = dalloc<unsigned long long>(MAXT);
@@ -539,9 +551,19 @@ void Engine::enqueue_layers(int T, bool lanes, const GdnFn& gdn, bool dumps) {
         dd("ffn_out", l, cb_[0]->bo, N);
     }
     each([&](int, CardBuf& b, const CardW& w) {
-        add_norm(b, b.R, b.bo, w.out_norm, b.hfin, T, eps, true);
-        mv(b, w.out, b.xq, b.head_logits, T);
-        argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.err, b.st);
+        if (w.out_6p2.hi) {
+            add_norm_to(b.st, b.R, b.bo, w.out_norm, b.hfin, b.head_xtq, b.head_xtd, T, eps);
+            if (T <= 5) {
+                vhead_verify_6p2(w.out_6p2, b.head_xq, T, w.v0, b.best_v, b.best_i, b.am_keys, b.err, b.vh_work, b.st);
+            } else {
+                vhead_all_logits_6p2(w.out_6p2, b.head_xq, b.head_logits, T, b.st);
+                argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.err, b.st);
+            }
+        } else {
+            add_norm(b, b.R, b.bo, w.out_norm, b.hfin, T, eps, true);
+            mv(b, w.out, b.xq, b.head_logits, T);
+            argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.err, b.st);
+        }
     });
     dd("result_norm", -1, cb_[0]->hfin, N);
 }
@@ -607,7 +629,14 @@ void Engine::mtp_attach(const Mtp& mtp) {
         b.mtp_src = dalloc<float>((size_t) MAXT * N);
         b.mtp_R = dalloc<float>((size_t) MAXT * N);
         b.mtp_out = dalloc<float>((size_t) MAXT * N);
-        b.mtp_logits = dalloc<float>((size_t) std::max(1, mc.dv1 - mc.dv0));
+        b.mtp_logits = dalloc<float>(mtp.shared_6p2 ? (size_t) 1 : (size_t) std::max(1, mc.dv1 - mc.dv0));
+        if (mtp.shared_6p2) {
+            b.mtp_xq = dalloc<uint8_t>(q8_1_bytes(N));
+            b.mtp_xtq = dalloc<int8_t>(N);
+            b.mtp_xtd = dalloc<float>(N / 32);
+            q8_twin(b.mtp_xq, q8_1_bytes(N), b.mtp_xtq, b.mtp_xtd);
+            own([q = (const void*) b.mtp_xq] { q8_untwin(q); });
+        }
         b.mtp_bv = dalloc<float>(1);
         b.mtp_bi = dalloc<int>(1);
         b.mtp_ctl = dalloc<int>(2);
@@ -627,8 +656,12 @@ void Engine::mtp_attach(const Mtp& mtp) {
         h_.mtp_tk_i = halloc<int>((size_t) NCARD * TOPK_N);
         h_.mtp_tk_err = halloc<unsigned>(NCARD);
     }
-    draft_index_.assign((size_t) m_.vocab, -1);
-    for (size_t i = 0; i < mtp.vocab.size(); ++i) draft_index_[(size_t) mtp.vocab[i]] = (int) i;
+    if (!mtp.shared_6p2) {
+        draft_index_.assign((size_t) m_.vocab, -1);
+        for (size_t i = 0; i < mtp.vocab.size(); ++i) draft_index_[(size_t) mtp.vocab[i]] = (int) i;
+    } else {
+        draft_index_.clear();
+    }
     if (!h_.bv) {
         h_.bv = halloc<float>(NCARD * MAXT);
         h_.bi = halloc<int>(NCARD * MAXT);
@@ -663,10 +696,16 @@ void Engine::mtp_enqueue(int T) {
         const MtpCard& mc = mtp_->cards[c];
         const int nv = mc.dv1 - mc.dv0;
         ck(cudaSetDevice(b.dev), "set");
-        add_norm(b, b.mtp_R, b.bo, w.mtp_head_norm, b.mtp_out, T, eps, true, true);
-        mv(b, mc.head, b.xq, b.mtp_logits, 1);
-        penalize_row(b.mtp_logits, nv, b.mtp_pen, b.mtp_pen_par, b.st);
-        argmax(b.mtp_logits, nv, 1, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.err, b.st);
+        if (mtp_->shared_6p2) {
+            add_norm_to(b.st, b.mtp_R, b.bo, w.mtp_head_norm, b.mtp_out, b.mtp_xtq, b.mtp_xtd, T, eps, true);
+            vhead_mtp_fast_6p2(w.out_6p2, w.out_cent_f16, w.out_cluster_off, w.out_n_clusters, mtp_->top_clusters, b.mtp_xq, 1, w.v0,
+                               b.mtp_pen, b.mtp_pen_par, b.mtp_bv, b.mtp_bi, b.am_keys, b.err, b.vh_work, b.st);
+        } else {
+            add_norm(b, b.mtp_R, b.bo, w.mtp_head_norm, b.mtp_out, T, eps, true, true);
+            mv(b, mc.head, b.xq, b.mtp_logits, 1);
+            penalize_row(b.mtp_logits, nv, b.mtp_pen, b.mtp_pen_par, b.st);
+            argmax(b.mtp_logits, nv, 1, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.err, b.st);
+        }
     }
 }
 

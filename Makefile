@@ -12,7 +12,21 @@
 #                   (build, never run)
 #   CUDA=path       the CUDA toolkit, /usr/local/cuda by default: nvcc, CUPTI and llama.cpp's build all come from it
 .DEFAULT_GOAL := build
-.PHONY: build install test-bin ref trace
+.PHONY: build install test-bin test_kq_avx1 ref trace
+# Pinned CUDA 12.8 toolchain on HP Z420 when present (override with NVCC=/CUDA=/HOSTCXX=); preserves upstream fallback
+PINNED_CUDA_128 := /mnt/samsung_storage/toolchains/cuda128
+ifneq ($(wildcard $(PINNED_CUDA_128)/bin/nvcc),)
+CUDA ?= $(PINNED_CUDA_128)
+HOSTCXX ?= $(if $(wildcard $(PINNED_CUDA_128)/bin/g++),$(PINNED_CUDA_128)/bin/g++,$(PINNED_CUDA_128)/bin/x86_64-conda-linux-gnu-g++)
+HOSTCC ?= $(if $(wildcard $(PINNED_CUDA_128)/bin/gcc),$(PINNED_CUDA_128)/bin/gcc,$(PINNED_CUDA_128)/bin/x86_64-conda-linux-gnu-gcc)
+ifneq ($(wildcard $(PINNED_CUDA_128)/bin/cuobjdump),)
+CUOBJDUMP ?= $(PINNED_CUDA_128)/bin/cuobjdump
+else ifneq ($(wildcard $(PINNED_CUDA_128)/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump),)
+CUOBJDUMP ?= $(PINNED_CUDA_128)/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump
+endif
+HOST_LDFLAGS ?= -Wl,-rpath,$(PINNED_CUDA_128)/lib -Wl,-rpath-link,$(CURDIR)/llama.cpp/build/bin -Wl,--allow-shlib-undefined
+CUDA_RPATH ?= -Xlinker -rpath,$(PINNED_CUDA_128)/lib -Xlinker -rpath,$(PINNED_CUDA_128)/targets/x86_64-linux/lib
+else
 CUDA ?= /usr/local/cuda
 # Z420 sm61-port: the host compilers (g++-14 upstream) and cuobjdump as variables, and for ARCH=61 the Ivy Bridge
 # host ISA (Xeon E5-2697 v2: AVX + F16C, no AVX2/FMA) so no host object can SIGILL there; z420_build.sh sets them
@@ -20,8 +34,12 @@ HOSTCXX ?= g++-14
 # extra host link flags (Z420: the conda linker needs -rpath-link to llama.cpp's libraries and the driver's libcuda)
 HOST_LDFLAGS ?=
 HOSTCC ?= gcc-14
+CUDA_RPATH ?=
+endif
 CUOBJDUMP ?= $(CUDA)/bin/cuobjdump
-NVCC := $(CUDA)/bin/nvcc
+NVCC ?= $(CUDA)/bin/nvcc
+CUDA_INC := $(if $(wildcard $(CUDA)/targets/x86_64-linux/include/cuda_runtime.h),$(CUDA)/targets/x86_64-linux/include,$(CUDA)/include)
+CUDA_LIB := $(if $(wildcard $(CUDA)/targets/x86_64-linux/lib/libcudart.so),$(CUDA)/targets/x86_64-linux/lib,$(CUDA)/lib64)
 # 70 is prod's. 86 has run on RTX 3090s at a tester's (CUDA 12.9 there: with 12.8 and driver 595 the engine hung in
 # cudaGraphInstantiate); its numbers are theirs (docs/verification.md). 80, 89, 90, 100 and 120 compile (every object,
 # nvcc 12.9) and have never run; what a card must be beyond its arch the engine checks when it starts
@@ -40,7 +58,7 @@ ref: ref/fnx_ref ref/fnx_logref ref/img_logref ref/mmid_bench
 trace: tools/trace/libcupti_trace.so
 CUPTI := $(CUDA)/extras/CUPTI
 tools/trace/libcupti_trace.so: tools/trace/cupti_trace.cpp
-	$(HOSTCXX) -O2 -std=c++17 $(HOST_ISA) -pthread -shared -fPIC -I$(CUPTI)/include -I$(CUDA)/include -o $@ $< \
+	$(HOSTCXX) -O2 -std=c++17 $(HOST_ISA) -pthread -shared -fPIC -I$(CUPTI)/include -I$(CUDA_INC) -o $@ $< \
 	    -L$(CUPTI)/lib64 -Wl,-rpath,$(CUPTI)/lib64 -lcupti -lpthread
 # no built-in rules: with them make remakes an included build/kernels_p0.d by `%: %.o` from build/kernels_p0.d.o, which
 # the kernels_p% rule then compiles with FNX_KPART=0.d ("floating constant in preprocessor expression")
@@ -48,7 +66,7 @@ MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 build: bin/sfnx bin/sfnx-vision
 test-bin: bin/fnx_run bin/batch_test bin/cache_test bin/sample_test bin/gguf_test bin/topk_test bin/sfnx_input_test bin/batch_plan_test \
-          bin/stage_test bin/pf_ring_plan_test bin/rope_test bin/card_check_test bin/ple_test
+          bin/stage_test bin/pf_ring_plan_test bin/rope_test bin/card_check_test bin/ple_test $(if $(filter 0,$(FNX_27B)),bin/test_kq_avx1,)
 CONFIG ?= serve/sfnx.json
 # The config is checked as the front end checks it before loading anything (front.check_config), so a config it would
 # refuse stops the install rather than a boot; what needs the model (the context against its trained length) the engine
@@ -83,9 +101,11 @@ $(if $(word 2,$(FNX_NCARD)),$(error FNX_NCARD: one value, not '$(FNX_NCARD)'))
 $(if $(filter 2 3 4 6 8,$(FNX_NCARD)),,$(error FNX_NCARD: 2, 3, 4, 6 or 8 (the 24 query heads and 48 value heads split evenly, a 32-value FF block on every card, at most 8 for CUDA's peers a card), not '$(FNX_NCARD)'))
 NVFLAGS += -DFNX_NCARD=$(FNX_NCARD) -DFNX_ARCH=$(ARCH)
 ifeq ($(ARCH),61)
-HOST_ISA ?= -march=ivybridge -mtune=ivybridge -mavx -mf16c -mno-avx2 -mno-fma
+HOST_ISA ?= -march=ivybridge -mtune=ivybridge -mavx -msse4.2 -mf16c -mno-avx2 -mno-fma
 LLAMA_ISA ?= -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=ON -DGGML_AVX512=OFF -DGGML_BMI2=OFF
 endif
+# Strict Ivy Bridge host SIMD flags for CPU cold-expert AVX1+F16C kernels (zero AVX2/FMA/BMI2)
+KQ_AVX1_ISA := -O3 -march=ivybridge -mtune=ivybridge -mavx -msse4.2 -mf16c -mno-avx2 -mno-fma
 NVFLAGS += $(if $(HOST_ISA),-Xcompiler "$(HOST_ISA)")
 # the model (src/model.hpp): fnx (Flash-Next, prod) or 27b (Qwen3.8-27B: src/s27_*, bin/s27_run). build/model holds
 # it as build/ncard holds the count; the 27B is built for two, three or four cards (src/s27_attn.cuh: every card reads
@@ -142,12 +162,20 @@ bin/card_check_test: tools/card_check_test.cpp src/card_check.hpp src/peer_probe
 # one object per source in build/ (headers tracked by nvcc's own dependency files), so a change recompiles only the
 # objects it touches; every engine program and the lab's library link the same objects (position independent).
 # kernels.cu compiles as KPARTS objects in parallel (make -j), each with its share of the launchers (FNX_KPART)
-KPARTS := 0 1 2 3 4 5 6 7 8
+KPARTS := 0 1 2 3 4 5 6 7 8 9
 KERN_OBJ := $(foreach p,$(KPARTS),build/kernels_p$(p).o)
 # the 27B's Engine (engine.hpp's interface) is its own: s27_engine.cu and its prompt path; everything else links shared
 ENG_MODEL := $(if $(filter 1,$(FNX_27B)),s27_,)
-ENG_OBJ := build/gguf.o build/model.o build/ple_io.o build/store.o $(KERN_OBJ) build/moe_mma.o build/$(ENG_MODEL)engine.o build/engine_common.o build/peer_probe.o build/$(ENG_MODEL)prefill.o build/session.o build/batch.o
+FNX_CPU_OBJ := $(if $(filter 0,$(FNX_27B)),build/kq_avx1.o,)
+ENG_OBJ := build/gguf.o build/model.o build/ple_io.o build/store.o $(KERN_OBJ) build/moe_mma.o $(FNX_CPU_OBJ) build/$(ENG_MODEL)engine.o build/engine_common.o build/peer_probe.o build/$(ENG_MODEL)prefill.o build/session.o build/batch.o
 PIC := -Xcompiler -fPIC
+build/kq_avx1.o: src/kq_avx1.cpp $(STAMPS)
+	@mkdir -p build
+	$(HOSTCXX) $(KQ_AVX1_ISA) -std=c++17 -fPIC -pthread -Wall -DFNX_NCARD=$(FNX_NCARD) -DFNX_ARCH=$(ARCH) -DFNX_27B=$(FNX_27B) -Isrc -I$(CUDA_INC) -I$(GG)/include -I$(GG)/src -MD -MF build/kq_avx1.d -c -o $@ $<
+test_kq_avx1: bin/test_kq_avx1
+bin/test_kq_avx1: tools/test_kq_avx1.cpp build/kq_avx1.o $(STAMPS)
+	@mkdir -p bin
+	$(HOSTCXX) $(KQ_AVX1_ISA) -std=c++17 -pthread -Wall -DFNX_NCARD=$(FNX_NCARD) -DFNX_ARCH=$(ARCH) -DFNX_27B=$(FNX_27B) -Isrc -I$(CUDA_INC) -I$(GG)/include -I$(GG)/src -o $@ tools/test_kq_avx1.cpp build/kq_avx1.o -L$(CUDA_LIB) -Wl,-rpath,$(CUDA_LIB) -Wl,-rpath,$(CUDA)/lib -lcudart -lpthread
 build/kernels_p%.o: src/kernels.cu $(STAMPS)
 	@mkdir -p build
 	$(NVCC) $(NVFLAGS) $(PIC) -DFNX_KPART=$* -MD -MF build/kernels_p$*.d -c -o $@ $<
@@ -167,27 +195,34 @@ build/tool_%.o: tools/%.cu $(STAMPS)
 
 bin/load_probe: build/tool_load_probe.o build/gguf.o build/model.o build/ple_io.o build/store.o
 	@mkdir -p bin
-	$(NVCC) $(NVFLAGS) -o $@ $^ -lcuda
+	$(NVCC) $(NVFLAGS) $(CUDA_RPATH) -o $@ $^ -lcuda
 bin/s27_run: build/tool_s27_run.o $(ENG_OBJ)
 	@mkdir -p bin
-	$(NVCC) $(NVFLAGS) -o $@ $^ -lcublas -lcuda -lpthread
+	$(NVCC) $(NVFLAGS) $(CUDA_RPATH) -o $@ $^ -lcublas -lcuda -lpthread
 bin/s27_bw_probe: build/tool_s27_bw_probe.o
 	@mkdir -p bin
-	$(NVCC) $(NVFLAGS) -o $@ $^
+	$(NVCC) $(NVFLAGS) $(CUDA_RPATH) -o $@ $^
 bin/kbench bin/s27_probe bin/s27_ring_test bin/moe_mma_bench bin/topk_test: bin/%: build/tool_%.o $(KERN_OBJ) build/moe_mma.o
 	@mkdir -p bin
-	$(NVCC) $(NVFLAGS) -o $@ $^
+	$(NVCC) $(NVFLAGS) $(CUDA_RPATH) -o $@ $^
+
+bin/vhead_6p2_test bin/hc8_test: bin/%: build/tool_%.o build/gguf.o $(KERN_OBJ) build/moe_mma.o
+	@mkdir -p bin
+	$(NVCC) $(NVFLAGS) $(CUDA_RPATH) -o $@ $^
+bin/build_qwen38_vhead_clusters: build/tool_build_qwen38_vhead_clusters.o build/gguf.o
+	@mkdir -p bin
+	$(NVCC) $(NVFLAGS) $(CUDA_RPATH) -o $@ $^ -lcublas
 bin/sfnx: build/tool_sfnx.o $(ENG_OBJ)
 	@mkdir -p bin
-	$(NVCC) $(NVFLAGS) -o $@ $^ -lcublas -lcuda -lpthread
+	$(NVCC) $(NVFLAGS) $(CUDA_RPATH) -o $@ $^ -lcublas -lcuda -lpthread
 bin/fnx_run bin/sample_test bin/cache_test bin/lanes_test bin/batch_test: bin/%: build/tool_%.o $(ENG_OBJ)
 	@mkdir -p bin
-	$(NVCC) $(NVFLAGS) -o $@ $^ -lcublas -lcuda -lpthread
+	$(NVCC) $(NVFLAGS) $(CUDA_RPATH) -o $@ $^ -lcublas -lcuda -lpthread
 
 # the lab (tools/fnx_lab.cpp): bin/fnx_lab keeps the model loaded and runs fnx_run's commands from build/libfnx_lab.so,
 # which holds the engine and is reloaded after a rebuild; both use the shared CUDA runtime, and the lab exports the
 # model's code (gguf, model) to the library
-LAB_OBJ := $(KERN_OBJ) build/moe_mma.o build/engine.o build/engine_common.o build/peer_probe.o build/prefill.o build/session.o build/batch.o build/pic/tool_fnx_run.o
+LAB_OBJ := $(KERN_OBJ) build/moe_mma.o build/kq_avx1.o build/engine.o build/engine_common.o build/peer_probe.o build/prefill.o build/session.o build/batch.o build/pic/tool_fnx_run.o
 build/pic/tool_fnx_run.o: tools/fnx_run.cpp $(STAMPS)
 	@mkdir -p build/pic
 	$(NVCC) $(NVFLAGS) -Xcompiler -fPIC -DFNX_LAB_LIB -MD -MF build/pic/tool_fnx_run.d -c -o $@ $<
@@ -227,11 +262,14 @@ LU := $(LLAMA)
 .PHONY: llama-check
 llama-check: $(LU)/build/bin/libmtmd.so
 	@lib=$(LU)/build/bin/libggml-cuda.so; dump=$(CUOBJDUMP); \
-	[ -x "$$dump" ] || { echo "llama-check: no cuobjdump at $$dump: CUDA=$(CUDA) is not a CUDA toolkit" >&2; exit 1; }; \
 	[ -f "$$lib" ] || { echo "llama-check: no $$lib: llama.cpp in $(LU)/build was built without CUDA (GGML_CUDA=ON)" >&2; exit 1; }; \
-	elf=$$("$$dump" --list-elf "$$lib") || { echo "llama-check: $$dump --list-elf $$lib failed" >&2; exit 1; }; \
-	got=$$(printf '%s\n' "$$elf" | sed -n 's/.*\.\(sm_[0-9a-z]*\)\.cubin$$/\1/p' | sort -u | tr '\n' ' '); \
-	[ "$$got" = "sm_$(ARCH) " ] || { echo "llama-check: $$lib holds kernels for '$$got', this build is for sm_$(ARCH): reconfigure llama.cpp with -DCMAKE_CUDA_ARCHITECTURES=$(ARCH) and rebuild it (cmake --build $(LU)/build --target mtmd llama)" >&2; exit 1; }; \
+	if [ -x "$$dump" ]; then \
+	    elf=$$("$$dump" --list-elf "$$lib") || { echo "llama-check: $$dump --list-elf $$lib failed" >&2; exit 1; }; \
+	    got=$$(printf '%s\n' "$$elf" | sed -n 's/.*\.\(sm_[0-9a-z]*\)\.cubin$$/\1/p' | sort -u | tr '\n' ' '); \
+	    [ "$$got" = "sm_$(ARCH) " ] || { echo "llama-check: $$lib holds kernels for '$$got', this build is for sm_$(ARCH): reconfigure llama.cpp with -DCMAKE_CUDA_ARCHITECTURES=$(ARCH) and rebuild it (cmake --build $(LU)/build --target mtmd llama)" >&2; exit 1; }; \
+	else \
+	    grep -qE "^CMAKE_CUDA_ARCHITECTURES:(STRING|UNINITIALIZED)=$(ARCH)$$" $(LU)/build/CMakeCache.txt || { echo "llama-check: no cuobjdump at $$dump and $(LU)/build/CMakeCache.txt missing CMAKE_CUDA_ARCHITECTURES=$(ARCH)" >&2; exit 1; }; \
+	fi; \
 	set -- $(LU)/build/CMakeFiles/*/CMakeCUDACompiler.cmake; \
 	[ -f "$$1" ] || { echo "llama-check: no $(LU)/build/CMakeFiles/*/CMakeCUDACompiler.cmake: CMake never configured CUDA there" >&2; exit 1; }; \
 	[ $$# = 1 ] || { echo "llama-check: $$# CMake versions configured $(LU)/build ($$*): which nvcc built it is unknown; move it aside and make builds it again" >&2; exit 1; }; \
@@ -265,5 +303,6 @@ $(LU)/build/bin/libmtmd.so:
 	test -d $(LU)/.git || { echo "clone llama.cpp at a37cc46 into $(LU) first (or make LLAMA=path)" >&2; exit 1; }
 	cmake -S $(LU) -B $(LU)/build -G Ninja -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$(ARCH) -DCMAKE_BUILD_TYPE=Release \
 	    -DCMAKE_C_COMPILER=$(HOSTCC) -DCMAKE_CXX_COMPILER=$(HOSTCXX) -DCMAKE_CUDA_HOST_COMPILER=$(HOSTCXX) $(LLAMA_ISA) \
-	    -DCMAKE_CUDA_COMPILER=$(NVCC)
-	cmake --build $(LU)/build --target mtmd llama
+	    $(if $(HOST_ISA),-DCMAKE_C_FLAGS="$(HOST_ISA)" -DCMAKE_CXX_FLAGS="$(HOST_ISA)",) \
+	    -DCMAKE_CUDA_COMPILER=$(NVCC) -DCMAKE_BUILD_RPATH="$(CUDA)/lib;$(CUDA_LIB)"
+	cmake --build $(LU)/build --target mtmd llama -j 12

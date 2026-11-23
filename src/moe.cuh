@@ -201,6 +201,191 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
     if (warp == 0) cache_plan(gu, nj, layer, ec, list);
 }
 
+// Hybrid GPU+CPU routing for FNX_CPU_EXPERTS=1: identical logits & top-10 selection as k_router_route, EXCEPT:
+//   - Only resident experts (resident_mask[layer * NEXP + e] != 0) are placed into GPU jobs_gu/jobs_dn.
+//   - Cold experts get topw = 0.0f on GPU (so ring_x skips them cleanly without zeroing part).
+//   - On card == 0: if n_cold_pairs == 0, writes wc_slot->n_cold_pairs = 0 and returns immediately without touching
+//     mixed or req_seq; otherwise packs cold pairs + active mixed rows and publishes req_seq via __threadfence_system().
+template <int T>
+__global__ void __launch_bounds__(RR_THREADS) k_router_route_split(
+    const float* __restrict__ W, const float* __restrict__ x, float* __restrict__ logits,
+    int* __restrict__ topi, float* __restrict__ topw, Job* __restrict__ gu, Job* __restrict__ dn,
+    int* __restrict__ njobs, unsigned* __restrict__ counter, const uint8_t* __restrict__ resident_mask,
+    int layer, int card, PolyWcSlot* __restrict__ wc_slot, const int* __restrict__ ctl, const ShexpUp su) {
+    static_assert(RR_THREADS == Q8S_THREADS, "the shared expert's q8s blocks in the split router's launch");
+    constexpr int NC = N / 4 / 32 / RR_WPR, L = NEXP + 1;
+    const int nrr = (int) gridDim.x - su.blocks;
+    if ((int) blockIdx.x >= nrr) {
+        shexp_up_block<T>(su, blockIdx.x - nrr);
+        return;
+    }
+    const int e = threadIdx.x, warp = e >> 5, lane = e & 31, rw = warp / RR_WPR, half = warp % RR_WPR;
+    const int row = blockIdx.x * RR_ROWS + rw;
+    __shared__ float rsum[T][RR_THREADS / 32];
+    if (row < L) {
+        const float4* w4 = reinterpret_cast<const float4*>(W + (size_t) row * N) + half * NC * 32;
+        float4 wv[NC];
+#pragma unroll
+        for (int i = 0; i < NC; ++i) wv[i] = __ldg(w4 + i * 32 + lane);
+#pragma unroll
+        for (int t = 0; t < T; t += 2) {
+            const bool two = t + 1 < T;
+            const float4* x4 = reinterpret_cast<const float4*>(x + (size_t) t * N) + half * NC * 32;
+            const float4* y4 = two ? x4 + N / 4 : x4;
+            float a = 0.f, c = 0.f;
+#pragma unroll
+            for (int i = 0; i < NC; ++i) {
+                const float4 b = x4[i * 32 + lane], d = y4[i * 32 + lane];
+                a += wv[i].x * b.x + wv[i].y * b.y + wv[i].z * b.z + wv[i].w * b.w;
+                c += wv[i].x * d.x + wv[i].y * d.y + wv[i].z * d.z + wv[i].w * d.w;
+            }
+            a = wsum(a);
+            c = wsum(c);
+            if (lane == 0) {
+                rsum[t][warp] = a;
+                if (two) rsum[t + 1][warp] = c;
+            }
+        }
+    }
+    __syncthreads();
+    for (int q = e; q < T * RR_ROWS; q += RR_THREADS) {
+        const int t = q / RR_ROWS, r = q % RR_ROWS, lrow = blockIdx.x * RR_ROWS + r;
+        if (lrow < L) logits[(size_t) t * L + lrow] = rsum[t][r * RR_WPR] + rsum[t][r * RR_WPR + 1];
+    }
+    __shared__ bool last;
+    __threadfence();
+    __syncthreads();
+    if (e == 0) last = atomicAdd(counter, 1u) == (unsigned) nrr - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+
+    __shared__ int ex[MAXT * TOPK];
+    __shared__ float ew[MAXT * TOPK];
+    static_assert(T * TOPK < RR_THREADS, "a thread per pick and one more (the job count) below");
+#pragma unroll 1
+    for (int t = warp; t < T; t += RR_THREADS / 32) {
+        float v[NEXP / 32];
+#pragma unroll
+        for (int i = 0; i < NEXP / 32; ++i) v[i] = __ldcg(logits + (size_t) t * L + lane + 32 * i);
+        unsigned taken = 0;
+        float top0 = 0.f, z = 0.f, wk = 0.f;
+#pragma unroll 1
+        for (int k = 0; k < TOPK; ++k) {
+            float bv = -INFINITY;
+            int bi = NEXP;
+#pragma unroll
+            for (int i = 0; i < NEXP / 32; ++i)
+                if (!(taken >> i & 1u) && v[i] > bv) { bv = v[i]; bi = lane + 32 * i; }
+#pragma unroll
+            for (int o = 16; o; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+            }
+            if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
+            if (k == 0) top0 = bv;
+            const float ek = __expf(bv - top0);
+            z += ek;
+            if (lane == k) {
+                wk = ek;
+                topi[t * TOPK + k] = bi;
+                ex[t * TOPK + k] = bi;
+            }
+        }
+        if (lane < TOPK) ew[t * TOPK + lane] = wk / z;
+    }
+    __syncthreads();
+
+    constexpr int P = T * TOPK;
+    __shared__ unsigned char is_res[MAXT * TOPK];
+    __shared__ int firstpair[NEXP], slots[NEXP], jobof[NEXP];
+    __shared__ unsigned char first[MAXT * TOPK];
+    if (e < P) {
+        const unsigned char r = resident_mask[(size_t) layer * NEXP + ex[e]] != 0 ? 1u : 0u;
+        is_res[e] = r;
+        topw[e] = r ? ew[e] : 0.0f;
+    }
+    for (int x2 = e; x2 < NEXP; x2 += RR_THREADS) {
+        firstpair[x2] = P;
+        slots[x2] = 0;
+    }
+    __syncthreads();
+    if (e < P && is_res[e]) atomicMin(&firstpair[ex[e]], e);
+    __syncthreads();
+    if (e < P) first[e] = (is_res[e] && firstpair[ex[e]] == e) ? 1u : 0u;
+    __syncthreads();
+    if (e < P && first[e]) {
+        int j = 0;
+        for (int q = 0; q < e; ++q) j += first[q];
+        jobof[ex[e]] = j;
+        gu[j].w = dn[j].w = ex[e];
+    }
+    __syncthreads();
+    if (e < P && is_res[e]) {
+        const int j = jobof[ex[e]], s = atomicAdd(&slots[ex[e]], 1);
+        gu[j].y[s] = e / TOPK;
+        gu[j].out[s] = dn[j].y[s] = dn[j].out[s] = e;
+    }
+    __syncthreads();
+    if (e < P && first[e]) gu[jobof[ex[e]]].n = dn[jobof[ex[e]]].n = slots[ex[e]];
+    if (e == P) {
+        int n = 0;
+        for (int q = 0; q < P; ++q) n += first[q];
+        njobs[0] = n;
+        *counter = 0u;
+    }
+
+    if (card != 0 || !wc_slot) return;
+    __shared__ int sh_ctok[MAXT * TOPK], sh_cexp[MAXT * TOPK];
+    __shared__ float sh_cw[MAXT * TOPK];
+    __shared__ int n_cold;
+    __shared__ unsigned cold_tok_mask;
+    if (e == 0) {
+        int nc = 0;
+        unsigned tmask = 0u;
+        for (int q = 0; q < P; ++q) {
+            if (!is_res[q]) {
+                const int tok = q / TOPK;
+                sh_ctok[nc] = tok;
+                sh_cexp[nc] = ex[q];
+                sh_cw[nc] = ew[q];
+                tmask |= 1u << tok;
+                ++nc;
+            }
+        }
+        n_cold = nc;
+        cold_tok_mask = tmask;
+        if (nc == 0) {
+            *(volatile int32_t*) &wc_slot->n_cold_pairs = 0;
+        } else {
+            wc_slot->layer = layer;
+            wc_slot->T = T;
+            *(volatile int32_t*) &wc_slot->n_cold_pairs = nc;
+        }
+    }
+    __syncthreads();
+    if (n_cold == 0) return;
+    if (e < n_cold) {
+        wc_slot->cold_tok[e] = sh_ctok[e];
+        wc_slot->cold_exp[e] = sh_cexp[e];
+        wc_slot->cold_w[e] = sh_cw[e];
+    }
+    for (int t = 0; t < T; ++t) {
+        if (!(cold_tok_mask & (1u << t))) continue;
+        const float4* src4 = reinterpret_cast<const float4*>(x + (size_t) t * N);
+        float4* dst4 = reinterpret_cast<float4*>(wc_slot->mixed + (size_t) t * N);
+        for (int idx = e; idx < N / 4; idx += RR_THREADS) dst4[idx] = __ldg(src4 + idx);
+    }
+    __syncthreads();
+    if (e == 0) {
+        __threadfence_system();
+        const uint32_t seq = poly_wc_seq((unsigned) ctl[1], layer);
+        *(volatile uint32_t*) &wc_slot->req_seq = seq;
+        __threadfence_system();
+    }
+}
+
 // rows of one job: tmp[j] = W row . y[ys[j]] for j < n <= TT, G lanes per row
 template <ggml_type type, int G, int TT>
 __device__ __forceinline__ void job_rows(const char* wr, bool live, int ncols, int n, const block_q8_1* y, const int* ys,

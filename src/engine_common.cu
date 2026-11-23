@@ -303,6 +303,19 @@ std::vector<std::function<void()>> take_owned() {
     return std::move(owned_list());
 }
 
+void Engine::log_cpu_pool_stats(const char* tag) const {
+#if !FNX_27B
+    if (!cpu_pool_) return;
+    const CpuExpertPool::Stats st = cpu_pool_->stats();
+    std::fprintf(stderr, "fnx: cpu_pool%s%s%s: calls=%llu fast_skips=%llu cold_pairs=%llu busy_ms=%.2f\n",
+                 tag ? " (" : "", tag ? tag : "", tag ? ")" : "",
+                 (unsigned long long) st.calls, (unsigned long long) st.fast_skips,
+                 (unsigned long long) st.cold_pairs, (double) st.busy_ns * 1e-6);
+#else
+    (void) tag;
+#endif
+}
+
 // every card idle, the window graphs destroyed, then what the engine made released, newest first (errors ignored: a
 // destructor must not throw, and the process may be on its way out)
 Engine::~Engine() {
@@ -313,6 +326,12 @@ Engine::~Engine() {
             for (CardBuf::GraphSlot& s : *slots)
                 if (s.exec) cudaGraphExecDestroy(s.exec);
     }
+#if !FNX_27B
+    if (cpu_pool_) {
+        if (env_flag("FNX_PF_TIMING") || env_flag("FNX_STATS")) log_cpu_pool_stats("engine");
+        cpu_pool_.reset();
+    }
+#endif
     std::vector<std::function<void()>> o = take_owned();
     for (auto it = o.rbegin(); it != o.rend(); ++it) (*it)();
     cudaGetLastError();
@@ -574,6 +593,10 @@ std::vector<float> Engine::last_logits(int T) const {
         const CardW& w = m_.cards[c];
         ck(cudaSetDevice(cb_[c]->dev), "set");
         const int nv = w.v1 - w.v0;
+        if (w.out_6p2.hi) {
+            vhead_all_logits_6p2(w.out_6p2, cb_[c]->head_xq, cb_[c]->head_logits, T, cb_[c]->st);
+            ck(cudaStreamSynchronize(cb_[c]->st), "logits sync");
+        }
         for (int t = 0; t < T; ++t)
             ck(cudaMemcpy(out.data() + (size_t) t * vocab + w.v0, cb_[c]->head_logits + (size_t) t * nv, (size_t) nv * 4,
                           cudaMemcpyDeviceToHost), "logits");
@@ -628,8 +651,19 @@ std::vector<std::vector<std::pair<float, int>>> Engine::top_tokens(int T, const 
         ck(cudaMemcpyAsync(b.tk_pen_n, tk_.pen_n, (size_t) T * 4, cudaMemcpyHostToDevice, b.st), "penalties");
         ck(cudaMemcpyAsync(b.tk_par, tk_.par, (size_t) T * 3 * 4, cudaMemcpyHostToDevice, b.st), "penalties");
         ck(cudaMemsetAsync(b.tk_err, 0, 4, b.st), "top err");
-        fnx::top_tokens(b.head_logits, w.v1 - w.v0, T, w.v0, b.tk_pen_tok, b.tk_pen_cnt, b.tk_pen_n, stride, b.tk_par,
-                        b.tk_v, b.tk_i, b.tk_err, b.st);
+        if (w.out_6p2.hi) {
+            if (T <= 5) {
+                fnx::vhead_top_tokens_6p2(w.out_6p2, b.head_xq, T, w.v0, b.tk_pen_tok, b.tk_pen_cnt, b.tk_pen_n, stride, b.tk_par,
+                                          b.tk_v, b.tk_i, b.tk_err, b.vh_work, b.st);
+            } else {
+                fnx::vhead_all_logits_6p2(w.out_6p2, b.head_xq, b.head_logits, T, b.st);
+                fnx::top_tokens(b.head_logits, w.v1 - w.v0, T, w.v0, b.tk_pen_tok, b.tk_pen_cnt, b.tk_pen_n, stride, b.tk_par,
+                                b.tk_v, b.tk_i, b.tk_err, b.st);
+            }
+        } else {
+            fnx::top_tokens(b.head_logits, w.v1 - w.v0, T, w.v0, b.tk_pen_tok, b.tk_pen_cnt, b.tk_pen_n, stride, b.tk_par,
+                            b.tk_v, b.tk_i, b.tk_err, b.st);
+        }
         ck(cudaMemcpyAsync(tk_.v + (size_t) c * MAXT * TOPK_N, b.tk_v, (size_t) T * TOPK_N * 4, cudaMemcpyDeviceToHost, b.st), "top v");
         ck(cudaMemcpyAsync(tk_.i + (size_t) c * MAXT * TOPK_N, b.tk_i, (size_t) T * TOPK_N * 4, cudaMemcpyDeviceToHost, b.st), "top i");
         ck(cudaMemcpyAsync(tk_.err + c, b.tk_err, 4, cudaMemcpyDeviceToHost, b.st), "top err");
@@ -1228,9 +1262,15 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
             const MtpCard& mc = mtp_->cards[c];
             int* hp = h_.mtp_pen + (size_t) c * (1 + 2 * PEN_CAP);
             int k = 0;
-            for (const auto& [tok, cnt] : pen->counts) {
-                const int di = tok >= 0 && tok < (int) draft_index_.size() ? draft_index_[(size_t) tok] : -1;
-                if (di >= mc.dv0 && di < mc.dv1) hp[1 + k] = di - mc.dv0, hp[1 + PEN_CAP + k] = cnt, ++k;
+            if (mtp_->shared_6p2) {
+                const CardW& cw = m_.cards[c];
+                for (const auto& [tok, cnt] : pen->counts)
+                    if (tok >= cw.v0 && tok < cw.v1) hp[1 + k] = tok - cw.v0, hp[1 + PEN_CAP + k] = cnt, ++k;
+            } else {
+                for (const auto& [tok, cnt] : pen->counts) {
+                    const int di = tok >= 0 && tok < (int) draft_index_.size() ? draft_index_[(size_t) tok] : -1;
+                    if (di >= mc.dv0 && di < mc.dv1) hp[1 + k] = di - mc.dv0, hp[1 + PEN_CAP + k] = cnt, ++k;
+                }
             }
             std::memmove(hp + 1 + k, hp + 1 + PEN_CAP, (size_t) k * 4);   // counts right after the indexes
             hp[0] = pen_k[c] = k;
@@ -1266,8 +1306,12 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
         const int nv = mc.dv1 - mc.dv0, last = MTP_HEAD_EVERY_ROW ? T - 1 : 0;   // the last row's head row
         if (cands && nv > 0) {   // the last row's logits are penalized already
             ck(cudaMemsetAsync(b.mtp_tk_err, 0, 4, b.st), "draft top err");
-            fnx::top_tokens(b.mtp_logits + (size_t) last * nv, nv, 1, mc.dv0, b.mtp_zero, b.mtp_zero, b.mtp_zero, 0, b.mtp_pen_par,
-                       b.mtp_tk_v, b.mtp_tk_i, b.mtp_tk_err, b.st);
+            if (mtp_->shared_6p2) {
+                fnx::vhead_mtp_fast_topk_6p2(m_.cards[c].out_6p2, last, m_.cards[c].v0, b.mtp_tk_v, b.mtp_tk_i, b.mtp_tk_err, b.vh_work, b.st);
+            } else {
+                fnx::top_tokens(b.mtp_logits + (size_t) last * nv, nv, 1, mc.dv0, b.mtp_zero, b.mtp_zero, b.mtp_zero, 0, b.mtp_pen_par,
+                                b.mtp_tk_v, b.mtp_tk_i, b.mtp_tk_err, b.st);
+            }
         }
         ck(cudaEventRecord(b.ev1, b.st), "event");
         ck(cudaMemcpyAsync(&h_.bv[c], b.mtp_bv + last, 4, cudaMemcpyDeviceToHost, b.st), "draft v");
@@ -1276,7 +1320,7 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
         if (cands && nv > 0) {
             ck(cudaMemcpyAsync(h_.mtp_tk_v + (size_t) c * TOPK_N, b.mtp_tk_v, TOPK_N * 4, cudaMemcpyDeviceToHost, b.st), "draft top v");
             ck(cudaMemcpyAsync(h_.mtp_tk_i + (size_t) c * TOPK_N, b.mtp_tk_i, TOPK_N * 4, cudaMemcpyDeviceToHost, b.st), "draft top i");
-            ck(cudaMemcpyAsync(h_.mtp_tk_err + c, b.mtp_tk_err, 4, cudaMemcpyDeviceToHost, b.st), "draft top err");
+            ck(cudaMemcpyAsync(h_.mtp_tk_err + c, mtp_->shared_6p2 ? err_word(b) : b.mtp_tk_err, 4, cudaMemcpyDeviceToHost, b.st), "draft top err");
         }
     });
     unsigned err = 0;
@@ -1295,13 +1339,14 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
     int best = 0;
     for (int c = 1; c < NCARD; ++c)
         if (mtp_->cards[c].dv1 > mtp_->cards[c].dv0 && h_.bv[c] > h_.bv[best]) best = c;
+    auto global_tok = [&](int id) { return mtp_->shared_6p2 ? id : mtp_->vocab[(size_t) id]; };
     if (cands) {
         last_draft_cands.clear();
         for (int c = 0; c < NCARD; ++c) {
             if (mtp_->cards[c].dv1 <= mtp_->cards[c].dv0) continue;
             if (h_.mtp_tk_err[c] & 16u) throw std::runtime_error("draft: the draft layer's logits hold a NaN or inf");
             for (int k = 0; k < TOPK_N; ++k)
-                last_draft_cands.emplace_back(h_.mtp_tk_v[(size_t) c * TOPK_N + k], mtp_->vocab[h_.mtp_tk_i[(size_t) c * TOPK_N + k]]);
+                last_draft_cands.emplace_back(h_.mtp_tk_v[(size_t) c * TOPK_N + k], global_tok(h_.mtp_tk_i[(size_t) c * TOPK_N + k]));
         }
         std::sort(last_draft_cands.begin(), last_draft_cands.end(), [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
             return a.first > b.first || (a.first == b.first && a.second < b.second);
@@ -1309,7 +1354,7 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
         last_draft_cands.resize(TOPK_N);
     }
     last_draft_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    return mtp_->vocab[h_.bi[best]];
+    return global_tok(h_.bi[best]);
 }
 
 }  // namespace fnx

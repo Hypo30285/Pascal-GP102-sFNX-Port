@@ -10,6 +10,7 @@
 #include <string>
 
 #include "model.hpp"
+#include "poly_wc_bridge.cuh"
 #include "rope.hpp"  // Rope, rope_pos, rope_unit_freq
 
 namespace fnx {
@@ -50,7 +51,7 @@ void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, 
 
 // the hyper-connection read (build_hc_mix) with the previous half's write folded in when bo_prev is not null:
 // R' = R + bo_prev * 2 sigmoid(inj_prev / HC); R <- R'; mixed = mean_c xn_c * sigmoid(up . silu(down . xn / HC));
-// inject = w_inj . xn (when w_inj); mixed also as q8_1 rows into q8 when not null. scratch: hc_scratch_floats(MAXT)
+// inject = w_inj . xn (when w_inj.q); mixed also as q8_1 rows into q8 when not null. scratch: hc_scratch_floats(MAXT)
 // floats, zeroed once (its last float is the read's grid barrier counter). One launch of a block per SM (up to
 // hc_blocks()) that needs every one of them resident: nothing else may run beside it. err: bit 4 set when its barrier
 // timed out.
@@ -62,7 +63,7 @@ int hc_blocks();    // the read's blocks of work; a card with fewer SMs runs the
 int hc_prepare(float* scratch, int cap = 0);
 int hc1_rows();   // FNX_HC1: windows of up to this many rows take the read's one-barrier form (read once; throws if bad)
 void hc_read(float* R, const float* bo_prev, const float* inj_prev, const float* w_norm, const Q8S& w_down,
-             const Q8S& w_up, const uint16_t* w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err,
+             const Q8S& w_up, const Q8S& w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err,
              int T, void* st, void* q8 = nullptr);
 // sets the barrier counter in an hc scratch so that it wraps after barriers_left more barriers (2 per read): a test
 // of the wrap (FNX_HC_BAR_WRAP)
@@ -276,6 +277,17 @@ void ple_post(float* R, const float* key, const float* value, const float* nk, c
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec = nullptr, int layer = -1, int* list = nullptr, const Q8S* sh_gu = nullptr,
                   int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr);
+// Hybrid GPU+CPU routing for FNX_CPU_EXPERTS=1: resident experts (resident_mask[layer * NEXP + e] == 1) go into GPU
+// jobs_gu/jobs_dn; cold experts (== 0) get topw = 0 on GPU and on card == 0 are packed into wc_slot (with mixed copied
+// and req_seq published via __threadfence_system() ONLY when n_cold_pairs > 0).
+void router_route_split(const float* W, const float* x, float* logits, int T, int* topi, float* topw,
+                        Job* jobs_gu, Job* jobs_dn, int* njobs, const uint8_t* resident_mask, int layer,
+                        int card, PolyWcSlot* wc_slot, const int* ctl, void* st,
+                        const Q8S* sh_gu = nullptr, int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr);
+// Waits for CpuExpertPool to publish wc_slot->done_seq == poly_wc_seq(ctl[1], layer) (fast-path skips polling and
+// zeroes cold_accum_dst when n_cold_pairs == 0; sets err bit 128 on timeout) and copies wc_slot->out into cold_accum_dst.
+void wc_bridge_wait_merge(const PolyWcSlot* wc_slot, const int* ctl, int layer, int T,
+                          float* cold_accum_dst, unsigned* err, void* st);
 // gu rows of 2*ffs: [gate | up] (A: per-expert stacked rows, stride sa). sh_down (Q4_K experts only): the shared
 // expert's swiglu of sh_gu ([T][2 * sh_ffs]) and down (N rows) into sh_out (row stride N), in the same launch
 void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* xq, float* gu, void* st,
@@ -310,6 +322,7 @@ struct RingMoe {
     const float* part = nullptr;
     const float* topw = nullptr;
     const float* logits = nullptr;
+    const float* cold_out = nullptr;   // card 0 only (FNX_CPU_EXPERTS=1): [T][N] weighted cold expert sum added before ring reduce
 };
 
 // FNX_NGRAM=disk, verify: the n-gram flag's value for "the rows will not come" (the host's read failed): the window's
@@ -329,7 +342,7 @@ struct Ring {
     unsigned* err;       // bit 1: a peer's value never came; bit 2: a NaN or inf (on the fp16 ring: a value past its
                          // range); bit 4: an hc read's grid barrier timed out; bit 16: a NaN or inf among the head's
                          // logits (the window's argmax); bits 32, 64: layer 1's n-gram rows timed out or the host's
-                         // read failed (FNX_NGRAM=disk, verify's ngram_wait_copy_k)
+                         // read failed (FNX_NGRAM=disk, verify's ngram_wait_copy_k); bit 128: PolyWcBridge CPU cold wait timed out
     bool f32 = false;    // fp32 words (buffers sized for them) instead of fp16 pairs
     int rows = MAXT;     // the row capacity the buffers were sized for
     // a ring for chunk-sized sums (plain fp16 words and a flag per block and hop): this card's flags and the next's
@@ -392,5 +405,52 @@ void penalize_row(float* row, int n, const int* pen, const float* par, void* st)
 constexpr int TOPK_N = 64;
 void top_tokens(float* logits, int n, int T, int v0, const int* pen_tok, const int* pen_cnt, const int* pen_n, int pen_stride,
                 const float* pen_par, float* out_v, int* out_i, unsigned* err, void* st);   // pen_par: per row repeat, freq, present
+
+// Lossless 6+2 interval split-plane LM head + clustered MTP fast-head
+struct VHeadWork {
+    int8_t* xq = nullptr;         // [MAXT * max_in]: aligned unpacked x int8 from q8_1
+    float* xd = nullptr;          // [MAXT * (max_in / 32)]: unpacked fp32 block scales from q8_1
+    float* xd_half = nullptr;     // [MAXT * (max_in / 32)]: 0.5f * da for Stage-1 fused int32 q2 scaling
+    int32_t* sx253 = nullptr;     // [MAXT * (max_in / 16)]: 253 * sum(x_q[0..15])
+    float2* act_meta = nullptr;   // [MAXT]: {||dx * x_q||_2, sum_{hb} 1.5f * |da| * sum|x_q|}
+    float* lb = nullptr;          // [MAXT * max_rows]
+    float* ub = nullptr;          // [MAXT * max_rows]
+    float* cta_max = nullptr;     // [vhead_cta_max_floats(max_rows, MAXT)]
+    float* lcut = nullptr;        // [MAXT]
+    int32_t* cand_idx = nullptr;  // [MAXT * max_rows]
+    uint32_t* cand_cnt = nullptr; // [MAXT]
+    int max_rows = 0;
+    int max_in = 0;
+};
+
+void pack_q80_to_6p2_host(const void* q8_src, size_t row_bytes, int rows, int cols,
+                           const int32_t* perm_to_vocab,
+                           uint32_t* hi_out, uint32_t* lo_out, uint16_t* d_out, float2* row_meta_out);
+int vhead_max_cta(int rows, int T);
+size_t vhead_cta_max_floats(int rows, int T);
+
+// Exact 0-ULP Stage-2 logits for all rows (vocab order, y is q8_1 rows)
+void vhead_all_logits_6p2(const VHead6p2& w, const void* y, float* logits, int T, void* st);
+
+// Exact 0-ULP interval-pruned greedy argmax over this card's vocab slice: best[t] = (value, global_vocab_id)
+void vhead_verify_6p2(const VHead6p2& w, const void* y, int T, int v0, float* best_v, int* best_i,
+                      unsigned long long* keys, unsigned* err, const VHeadWork& work, void* st);
+
+// Exact 0-ULP interval-pruned penalized TOPK_N candidates over this card's vocab slice
+void vhead_top_tokens_6p2(const VHead6p2& w, const void* y, int T, int v0,
+                          const int* pen_tok, const int* pen_cnt, const int* pen_n, int pen_stride,
+                          const float* pen_par, float* out_v, int* out_i, unsigned* err,
+                          const VHeadWork& work, void* st);
+
+// Clustered MTP fast-head: scores n_clusters unit centroids, takes top_clusters, evaluates exact Stage-2 rows,
+// applies penalize_row-format pen/pen_par to row T-1 if non-null, and outputs argmax (best_v, best_i) per row.
+void vhead_mtp_fast_6p2(const VHead6p2& w, const uint16_t* cent_f16, const int32_t* cluster_off, int n_clusters,
+                        int top_clusters, const void* y, int T, int v0, const int* pen, const float* pen_par,
+                        float* best_v, int* best_i, unsigned long long* keys, unsigned* err,
+                        const VHeadWork& work, void* st);
+
+// Extracts TOPK_N sorted candidates from row `row` (already computed + penalized in work.ub/cand_idx by vhead_mtp_fast_6p2).
+void vhead_mtp_fast_topk_6p2(const VHead6p2& w, int row, int v0, float* out_v, int* out_i, unsigned* err,
+                             const VHeadWork& work, void* st);
 
 }  // namespace fnx

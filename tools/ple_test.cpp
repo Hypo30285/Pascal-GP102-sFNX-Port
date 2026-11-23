@@ -63,12 +63,16 @@ bool run(const Gguf& g, const Tensor& t, const PleHash& ph, const std::vector<in
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
-        std::fprintf(stderr, "usage: %s MODEL.gguf PROMPT.bin...\n", argv[0]);
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: %s MODEL.gguf [PROMPT.bin...]\n", argv[0]);
         return 2;
     }
     try {
         Gguf g(argv[1]);
+        if (g.has_engram_override())
+            std::printf("engram override: %s\n", g.engram_path().c_str());
+        if (g.has_hybrid_splice())
+            std::printf("hybrid splice (%s): %s\n", g.hybrid_map().c_str(), g.hybrid_q6_path().c_str());
         const Tensor& t = g.t("per_layer_token_embd.weight");
         const std::string p = "qwen4exp.";
         PleHash ph;
@@ -83,11 +87,24 @@ int main(int argc, char** argv) {
             std::printf("%s\n%s\n", probe.describe().c_str(), probe.probe(4096).c_str());
         }
         bool ok = true;
-        for (int i = 2; i < argc; ++i) {
-            const std::vector<int> toks = ref_tokens(argv[i]);
-            std::printf("%s\n", argv[i]);
-            ok &= run(g, t, ph, toks, 4096, "prompt", (int) toks.size());
-            ok &= run(g, t, ph, toks, 1, "decode", 4000);
+        if (argc == 2) {
+            std::vector<int> toks(2048);
+            const int vocab = (int) g.t("token_embd.weight").ne[1];
+            uint64_t st = 0x517cc1b727220a95ull;
+            for (size_t i = 0; i < toks.size(); ++i) {
+                st = st * 6364136223846793005ull + 1442695040888963407ull;
+                toks[i] = (i % 256 == 127) ? (int) ph.eos : (int) ((st >> 33) % (uint64_t) vocab);
+            }
+            std::printf("synthetic (%zu tokens)\n", toks.size());
+            ok &= run(g, t, ph, toks, 512, "prompt", (int) toks.size());
+            ok &= run(g, t, ph, toks, 1, "decode", 512);
+        } else {
+            for (int i = 2; i < argc; ++i) {
+                const std::vector<int> toks = ref_tokens(argv[i]);
+                std::printf("%s\n", argv[i]);
+                ok &= run(g, t, ph, toks, 4096, "prompt", (int) toks.size());
+                ok &= run(g, t, ph, toks, 1, "decode", 4000);
+            }
         }
         std::printf(ok ? "PASS: every row the mapping's bytes\n" : "FAIL\n");
         return ok ? 0 : 1;

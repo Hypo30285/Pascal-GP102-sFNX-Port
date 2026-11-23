@@ -23,8 +23,12 @@
 // compiled in parts (Makefile: build/kernels_pN.o with -DFNX_KPART=N), each with its share of the launchers below and
 // so only the template kernels they instantiate: one file's ~700 kernels took ~7 minutes on one core
 #ifndef FNX_KPART
-#error "kernels.cu: compile with -DFNX_KPART=0..8 (one object per part)"
+#error "kernels.cu: compile with -DFNX_KPART=0..9 (one object per part)"
 #endif
+
+#if FNX_KPART == 9
+#include "lm_head_6p2_sm61.cuh"
+#else
 
 namespace fnx {
 
@@ -180,6 +184,7 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_mmvq(const char* __restrict__ 
 #include "dense.cuh"
 #include "moe.cuh"
 #include "moe_q4k.cuh"
+#include "moe_q6k.cuh"
 
 // ---------------------------------------------------------------- f32 matrix x vectors (router, alpha / beta, gates)
 // y[t][row] = W[row] . x[t]: a warp per row (WPR = 1) or a block per row (WPR = 4 warps, the columns split), n = N
@@ -355,7 +360,10 @@ __global__ void k_combine(const float* part, const float* topw, const float* sh,
     if (i >= N) return;
     float s = 0.f;
 #pragma unroll
-    for (int k = 0; k < TOPK; ++k) s = fmaf(topw[t * TOPK + k], part[((size_t) t * TOPK + k) * N + i], s);
+    for (int k = 0; k < TOPK; ++k) {
+        const float w = topw[t * TOPK + k];
+        if (w != 0.f) s = fmaf(w, part[((size_t) t * TOPK + k) * N + i], s);
+    }
     out[(size_t) t * N + i] = s + sigm(sh_logit[t]) * sh[(size_t) t * N + i];
 }
 
@@ -796,11 +804,15 @@ __device__ __forceinline__ int chi(int k) { return (k + 1) * NP / NCARD; }
 __device__ __forceinline__ float2 add2(float2 a, float2 b) { return make_float2(a.x + b.x, a.y + b.y); }
 
 // this card's addend for element (t, i): x, or the routed experts' weighted rows plus the gated shared row
+// (plus card 0's CPU-computed cold expert accumulation when m.cold_out is set; w != 0 guard skips cold pairs cleanly)
 __device__ __forceinline__ float ring_x(const float* x, const RingMoe& m, int T, int t, int i) {
     if (!m.part) return x[(size_t) t * N + i];
-    float s = 0.f;
+    float s = m.cold_out ? m.cold_out[(size_t) t * N + i] : 0.f;
 #pragma unroll
-    for (int k = 0; k < TOPK; ++k) s = fmaf(m.topw[t * TOPK + k], m.part[((size_t) t * TOPK + k) * N + i], s);
+    for (int k = 0; k < TOPK; ++k) {
+        const float w = m.topw[t * TOPK + k];
+        if (w != 0.f) s = fmaf(w, m.part[((size_t) t * TOPK + k) * N + i], s);
+    }
     return fmaf(sigm(m.logits[(size_t) t * (NEXP + 1) + NEXP]), m.part[((size_t) T * TOPK + t) * N + i], s);
 }
 __device__ __forceinline__ float2 ring_x2(const float* x, const RingMoe& m, int T, int t, int p) {
@@ -1054,7 +1066,7 @@ int hc_prepare(float* scratch, int cap) {
 }
 
 void hc_read(float* R, const float* bo, const float* inj_prev, const float* w_norm, const Q8S& w_down, const Q8S& w_up,
-             const uint16_t* w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err, int T, void* st,
+             const Q8S& w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err, int T, void* st,
              void* q8) {
     HcArgs a{R, bo, inj_prev, w_norm, w_down, w_up, w_inj, eps, mixed, inject, nullptr, nullptr, nullptr, nullptr, nullptr, err,
              (block_q8_1*) q8};
@@ -1484,6 +1496,67 @@ void copy_many(const CopyJob* jobs, int n, void* st) {
     if (n <= 0) return;
     k_copy_many<<<dim3(8, n), 256, 0, (cudaStream_t) st>>>(jobs);
     ck_launch("copy_many");
+}
+
+namespace {
+__device__ __forceinline__ float4 ld_cv_f4(const float4* p) {
+    float4 v;
+    asm volatile("ld.global.cv.v4.f32 {%0, %1, %2, %3}, [%4];"
+                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                 : "l"(p)
+                 : "memory");
+    return v;
+}
+
+__global__ void __launch_bounds__(512) k_wc_bridge_wait_merge(const PolyWcSlot* __restrict__ wc_slot,
+                                                              const int* __restrict__ ctl, int layer, int T,
+                                                              float* __restrict__ cold_accum_dst,
+                                                              unsigned* __restrict__ err) {
+    __shared__ int state;   // 0: fast skip or timeout (zero cold_accum_dst), 1: copy wc_slot->out -> cold_accum_dst
+    if (threadIdx.x == 0) {
+        const int nc = (int) fnx_ld_acquire_sys_u32(reinterpret_cast<const volatile unsigned*>(&wc_slot->n_cold_pairs));
+        if (nc <= 0) {
+            state = 0;
+        } else {
+            const uint32_t want = poly_wc_seq((unsigned) ctl[1], layer);
+            unsigned long long t0, t;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+            state = 0;
+            for (;;) {
+                const uint32_t done = fnx_ld_acquire_sys_u32(&wc_slot->done_seq);
+                if (done == want) {
+                    state = 1;
+                    break;
+                }
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+                if (t - t0 > (unsigned long long) POLY_WC_WAIT_S * 1000000000ull) {
+                    atomicOr(err, POLY_WC_ERR_BIT);
+                    break;
+                }
+                fnx_nanosleep(256);
+            }
+        }
+    }
+    __syncthreads();
+    const int n4 = (T * N) / 4;
+    float4* dst4 = reinterpret_cast<float4*>(cold_accum_dst);
+    if (state == 0) {
+        const float4 z = make_float4(0.f, 0.f, 0.f, 0.f);
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) dst4[i] = z;
+        return;
+    }
+    const float4* src4 = reinterpret_cast<const float4*>(wc_slot->out);
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) dst4[i] = ld_cv_f4(src4 + i);
+}
+}  // namespace
+
+void wc_bridge_wait_merge(const PolyWcSlot* wc_slot, const int* ctl, int layer, int T,
+                          float* cold_accum_dst, unsigned* err, void* st) {
+    if (!wc_slot || !ctl || !cold_accum_dst || !err) throw std::runtime_error("wc_bridge_wait_merge: null pointer");
+    if (layer < 0 || layer >= NL) throw std::runtime_error("wc_bridge_wait_merge: layer out of range");
+    if (T < 1 || T > MAXT) throw std::runtime_error("wc_bridge_wait_merge: T out of range");
+    k_wc_bridge_wait_merge<<<1, 512, 0, (cudaStream_t) st>>>(wc_slot, ctl, layer, T, cold_accum_dst, err);
+    ck_launch("wc_bridge_wait_merge");
 }
 #endif
 
@@ -1941,6 +2014,51 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
     ck_launch("router_route");
 }
 
+void router_route_split(const float* W, const float* x, float* logits, int T, int* topi, float* topw,
+                        Job* jobs_gu, Job* jobs_dn, int* njobs, const uint8_t* resident_mask, int layer,
+                        int card, PolyWcSlot* wc_slot, const int* ctl, void* st,
+                        const Q8S* sh_gu, int sh_rows, const void* sh_y, float* sh_out) {
+    if (!resident_mask) throw std::runtime_error("router_route_split: resident_mask is null");
+    if (layer < 0 || layer >= NL) throw std::runtime_error("router_route_split: layer out of range");
+    if (card == 0 && (!wc_slot || !ctl)) throw std::runtime_error("router_route_split: card 0 requires wc_slot and ctl");
+    cudaStream_t s = (cudaStream_t) st;
+    ShexpUp su;
+    if (sh_gu) {
+        if (sh_rows < 1 || sh_rows >= 4096) throw std::runtime_error("router_route_split: the shared gate|up takes 1..4095 rows");
+        for (int k = 0; k < Q8S_SEGS; ++k) su.w.q[k] = sh_gu->q, su.w.d[k] = sh_gu->d, su.w.out[k] = sh_out, su.w.end[k] = sh_rows, su.w.stride[k] = sh_rows;
+        su.rows = sh_rows, su.cols = N, su.blocks = (sh_rows + Q8S_THREADS / 32 - 1) / (Q8S_THREADS / 32);
+        su.y = (const block_q8_1*) sh_y;
+        int8_t* tq;
+        float* td;
+        twin_of(sh_y, N, tq, td);
+        su.tq = tq, su.td = td;
+    }
+    const int grid = (NEXP + 1 + RR_ROWS - 1) / RR_ROWS + su.blocks;
+    unsigned* counter = (unsigned*) (njobs + 1);
+#define FNX_RRS(t) k_router_route_split<t><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, resident_mask, layer, card, wc_slot, ctl, su)
+    switch (T) {
+        case 1: FNX_RRS(1); break;
+        case 2: FNX_RRS(2); break;
+        case 3: FNX_RRS(3); break;
+        case 4: FNX_RRS(4); break;
+        case 5: FNX_RRS(5); break;
+        case 6: FNX_RRS(6); break;
+        case 7: FNX_RRS(7); break;
+        case 8: FNX_RRS(8); break;
+        case 9: FNX_RRS(9); break;
+        case 10: FNX_RRS(10); break;
+        case 11: FNX_RRS(11); break;
+        case 12: FNX_RRS(12); break;
+        case 13: FNX_RRS(13); break;
+        case 14: FNX_RRS(14); break;
+        case 15: FNX_RRS(15); break;
+        case 16: FNX_RRS(16); break;
+        default: throw std::runtime_error("router_route_split: T out of range");
+    }
+#undef FNX_RRS
+    ck_launch("router_route_split");
+}
+
 #endif
 #if FNX_KPART == 2
 namespace {
@@ -1953,6 +2071,10 @@ void moe_mm(bool down, const DW& A, size_t sa, const Job* jobs, const int* njobs
         case T_Q4_K:
             if (down) moe_launch<GGML_TYPE_Q4_K>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T);
             else gu_q4k_launch(T, w, jobs, njobs, njobs_max, (const block_q8_1*) in, (float*) out, s);
+            break;
+        case T_Q6_K:
+            if (down) throw std::runtime_error("moe_down: Q6_K (block 256) does not fit DN_U=32");
+            gu_q6k_launch(T, w, jobs, njobs, njobs_max, (const block_q8_1*) in, (float*) out, s);
             break;
         case T_Q5_K: moe_launch<GGML_TYPE_Q5_K>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
         case T_Q5_1: moe_launch<GGML_TYPE_Q5_1>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
@@ -1987,13 +2109,17 @@ void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int 
         moe_mm(false, A, sa, jobs, njobs, njobs_max, xq, gu, st);
         return;
     }
-    if (A.type != T_Q4_K) throw std::runtime_error("moe_gate_up: the shared expert rides only in the Q4_K experts' launch");
+    if (A.type != T_Q4_K && A.type != T_Q6_K)
+        throw std::runtime_error("moe_gate_up: the shared expert rides only in the Q4_K/Q6_K experts' launch");
     if (sh_ffs < 32 || sh_ffs > SH_MAXF || sh_ffs % 32) throw std::runtime_error("moe_gate_up: the shared expert's FF slice");
     ShexpDown sd;
     for (int k = 0; k < Q8S_SEGS; ++k) sd.w.q[k] = sh_down->q, sd.w.d[k] = sh_down->d, sd.w.out[k] = sh_out, sd.w.end[k] = N, sd.w.stride[k] = N;
     sd.rows = N, sd.ffs = sh_ffs, sd.gu = sh_gu;
     const MoeW w{(const char*) A.p, sa, A.row_bytes, A.n_out, A.n_in, A.ep};
-    gu_q4k_launch(njobs_max / TOPK, w, jobs, njobs, njobs_max, (const block_q8_1*) xq, gu, (cudaStream_t) st, sd);
+    if (A.type == T_Q4_K)
+        gu_q4k_launch(njobs_max / TOPK, w, jobs, njobs, njobs_max, (const block_q8_1*) xq, gu, (cudaStream_t) st, sd);
+    else
+        gu_q6k_launch(njobs_max / TOPK, w, jobs, njobs, njobs_max, (const block_q8_1*) xq, gu, (cudaStream_t) st, sd);
     ck_launch("moe_gate_up (with the shared expert)");
 }
 namespace {
@@ -2009,6 +2135,12 @@ void moe_mm_big(bool down, const DW& A, size_t sa, const BigJob* jobs, const int
                 k_moe_gu_q4k_big<<<dim3((w.nrows + Q4K_ROWS - 1) / Q4K_ROWS, njobs_cap), Q4K_THREADS, 0, s>>>(w, jobs, njobs,
                                                                                                          (const block_q8_1*) in, (float*) out);
             }
+            break;
+        case T_Q6_K:
+            if (down) throw std::runtime_error("moe_down (big jobs): Q6_K (block 256) does not fit DN_U=32");
+            if (w.ncols != N || w.row_a != (size_t) N / 256 * 210) throw std::runtime_error("moe gate|up q6_K: row layout");
+            k_moe_gu_q6k_big<<<dim3((w.nrows + Q6K_ROWS - 1) / Q6K_ROWS, njobs_cap), Q6K_THREADS, 0, s>>>(w, jobs, njobs,
+                                                                                                         (const block_q8_1*) in, (float*) out);
             break;
         case T_Q5_K: moe_launch_big<GGML_TYPE_Q5_K>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
         case T_Q5_1: moe_launch_big<GGML_TYPE_Q5_1>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
@@ -2239,3 +2371,5 @@ void add_streams(const float* h, const float* e, float* R, int T, void* st) {
 }
 }  // namespace fnx
 #endif
+
+#endif  // FNX_KPART != 9
